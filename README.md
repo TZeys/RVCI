@@ -1,10 +1,10 @@
 <img width="144" height="144" alt="rvci" src="https://github.com/user-attachments/assets/d20da90c-899d-4941-a34f-7a460fd544d3" /> 
 
-### RVCI
+# RVCI
 
 RVCI (Rust Volume Control Interface) is a hardware-software project which can control individual app volumes in W10/11 using basic hardware
 
-# Showcase
+**Showcase**
 [Youtube Showcase Video](https://youtu.be/VwW_25K1vdo)
 
 
