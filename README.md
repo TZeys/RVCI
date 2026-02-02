@@ -31,3 +31,6 @@ Please note that you can add as many Pots as you want, but only # 1 ! 3-Way swit
 
 <img width="973" height="510" alt="image" src="https://github.com/user-attachments/assets/3469415b-2f4e-4836-9295-d8f03bc77c33" />
 
+# Important!
+Please flash the firmware.ino found in the repo onto your Arduino Nano, otherwise the companion app won't work
+
