@@ -1,0 +1,35 @@
+[package]
+name = "RVCI"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serialport = "4.6"
+tray-icon = "0.19"
+image = { version = "0.25", default-features = false, features = ["ico", "png"] }
+fltk = { version = "^1.4", features = ["fltk-bundled"] }
+winreg = "0.52"
+dirs = "6.0.0"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_UI_Shell",
+    "Win32_Security",
+    "Win32_UI_Shell_PropertiesSystem"
+
+] }
+[build-dependencies]
+winres = "0.1"
