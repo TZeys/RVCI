@@ -31,7 +31,7 @@ This project is quite customizable. For my version that I personally use you nee
 - A 3-Way Toggle Switch
 - Whatever enclosure you can come up with (3D printed, breadboard, shoebox, whatever)
 
-Please note that you can add as many Pots as you want, but only # 1 ! 3-Way switch is currently supported!
+Please note that you can add as many Pots as you want, but only **1** ! 3-Way switch is currently supported!
 
 ## Schematic
 
