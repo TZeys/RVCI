@@ -35,6 +35,7 @@ Please note that you can add as many Pots as you want, but only **1** ! 3-Way sw
 
 ## Important!
 1. This software requires SoundVolumeView! You can find it [here](https://www.nirsoft.net/utils/sound_volume_view.html)
+
 After installation of both SoundVolumeView and RVCI, please set the directory path
 to the SoundVolumeView.exe in the mapping.json file!
 
