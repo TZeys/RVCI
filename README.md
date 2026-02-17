@@ -45,6 +45,11 @@ to the SoundVolumeView.exe in the mapping.json file!
 
 <img width="973" height="510" alt="image" src="https://github.com/user-attachments/assets/3469415b-2f4e-4836-9295-d8f03bc77c33" />
 
+## Upcoming features and bugfixes
+
+- Fixing a bug causing duplication of knob mappings when deleting and adding a mapping
+- Implementing an "invert" toggle per knob
+
 
 
 
