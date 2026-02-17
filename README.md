@@ -33,10 +33,17 @@ This project is quite customizable. For my version that I personally use you nee
 
 Please note that you can add as many Pots as you want, but only **1** ! 3-Way switch is currently supported!
 
+## Important!
+1. This software requires SoundVolumeView! You can find it [here](https://www.nirsoft.net/utils/sound_volume_view.html)
+After installation of both SoundVolumeView and RVCI, please set the directory path
+to the SoundVolumeView.exe in the mapping.json file!
+
+2. Please flash the firmware.ino found in the repo onto your Arduino Nano, otherwise the companion app won't work
+
 ## Schematic
 
 <img width="973" height="510" alt="image" src="https://github.com/user-attachments/assets/3469415b-2f4e-4836-9295-d8f03bc77c33" />
 
-# Important!
-Please flash the firmware.ino found in the repo onto your Arduino Nano, otherwise the companion app won't work
+
+
 
