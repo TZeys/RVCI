@@ -43,13 +43,14 @@ to the SoundVolumeView.exe in the mapping.json file!
 
 ## Schematic
 
-<img width="973" height="510" alt="image" src="https://github.com/user-attachments/assets/3469415b-2f4e-4836-9295-d8f03bc77c33" />
+<img width="800" height="200" alt="image" src="https://github.com/user-attachments/assets/e5557f41-ae8c-4e13-879d-5889fd77f021" />
+
 
 ## Upcoming features and bugfixes
 
 - Fixing a bug causing duplication of knob mappings when deleting and adding a mapping
 - Implementing an "invert" toggle per knob
-
+- THT PCB for simple setups
 
 
 
