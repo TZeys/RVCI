@@ -43,7 +43,8 @@ to the SoundVolumeView.exe in the mapping.json file!
 
 ## Schematic
 
-<img width="800" height="200" alt="image" src="https://github.com/user-attachments/assets/e5557f41-ae8c-4e13-879d-5889fd77f021" />
+<img width="800" height="250" alt="image" src="https://github.com/user-attachments/assets/0705bf48-d2b6-495b-8a2f-7d2ab18cc0a7" />
+
 
 
 ## Upcoming features and bugfixes
