@@ -20,7 +20,8 @@ Also, I hated writing in Go
 The GUI lets you intuitively create, modify and delete knob mappings. Furthermore, you can easily change COM ports, Baudrate as well as between what Audio Outputs the device should switch between using a physical switch connected to the Arduino. A "Launch at Startup" option was also included,
 as deej never seemed to get it right somehow.
 
-<img width="281" height="489" alt="image" src="https://github.com/user-attachments/assets/8375a57a-db30-4431-aba9-d4a8df22741a" />
+<img width="284" height="487" alt="image" src="https://github.com/user-attachments/assets/e3cd1118-3f1b-4c19-9620-48b36cd845d8" />
+
 
 ## Hardware:
 
