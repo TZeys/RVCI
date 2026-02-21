@@ -57,6 +57,8 @@ struct SerialConfig { port: String, baud: u32, timeout: u64 }
 struct DialConfig {
     #[serde(rename = "type")] dial_type: String,
     process_name: Option<String>,
+    #[serde(default)]
+    inverted: bool,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -292,9 +294,7 @@ fn run_serial_processing(config: &AppConfig, config_path: &PathBuf, smoothers: &
     let mut line_buf = String::new();
     let mut last_update = Instant::now();
     
- 
     let mut last_applied_values: Vec<f32> = vec![-1.0; config.dials.len()];
-
 
     let mut pid_name_cache: HashMap<u32, String> = HashMap::new();
     let mut cache_counter = 0;
@@ -308,7 +308,6 @@ fn run_serial_processing(config: &AppConfig, config_path: &PathBuf, smoothers: &
     let last_file_mod = std::fs::metadata(config_path).and_then(|m| m.modified()).ok();
 
     loop {
-        // Check for config file changes
         if let Ok(meta) = std::fs::metadata(config_path) {
             if let Ok(mod_time) = meta.modified() {
                 if Some(mod_time) != last_file_mod { return Ok(()); }
@@ -322,7 +321,6 @@ fn run_serial_processing(config: &AppConfig, config_path: &PathBuf, smoothers: &
                 let line = line_buf.trim();
                 if line.is_empty() { continue; }
                 
-                // Handle Buttons
                 if line == "WORKS 1" {
                     switch_device(&config.soundvolumeview_path, &config.work_device_1);
                     continue; 
@@ -345,7 +343,12 @@ fn run_serial_processing(config: &AppConfig, config_path: &PathBuf, smoothers: &
 
                 for (i, part) in parts.iter().enumerate() {
                     if let Ok(raw_val) = part.parse::<f32>() {
-                        let normalized = raw_val.clamp(0.0, config.value_max) / config.value_max;
+                        let dial_cfg = &config.dials[i];
+                        let mut normalized = raw_val.clamp(0.0, config.value_max) / config.value_max;
+                        
+                        if dial_cfg.inverted {
+                            normalized = 1.0 - normalized;
+                        }
                         
                         if i >= smoothers.len() { smoothers.push(Smoother::new()); }
                         if i >= last_applied_values.len() { last_applied_values.push(-1.0); }
@@ -357,8 +360,6 @@ fn run_serial_processing(config: &AppConfig, config_path: &PathBuf, smoothers: &
                         }
                         
                         last_applied_values[i] = smoothed;
-                        
-                        let dial_cfg = &config.dials[i];
 
                         unsafe {
                             match dial_cfg.dial_type.as_str() {
@@ -507,6 +508,11 @@ fn refresh_knobs_ui(scroll_pack: &mut Pack, dials: &Vec<DialConfig>, active_proc
                 cp_clone.set_color(BG_COLOR);
             }
         });
+
+        let mut check_inv = CheckButton::default().with_label("Inv");
+        check_inv.set_label_color(TEXT_COLOR);
+        check_inv.set_value(dial.inverted);
+
         let mut btn_del = Button::default().with_label("X");
         style_widget(&mut btn_del);
         btn_del.set_label_color(Color::from_rgb(255, 100, 100));
@@ -519,6 +525,7 @@ fn refresh_knobs_ui(scroll_pack: &mut Pack, dials: &Vec<DialConfig>, active_proc
         });
         row.end();
         let _ = row.fixed(&lbl, 30);
+        let _ = row.fixed(&check_inv, 50);
         let _ = row.fixed(&btn_del, 30);
     }
     scroll_pack.end();
@@ -702,7 +709,35 @@ fn build_gui_and_run(config_path: PathBuf) -> Result<()> {
         let mut scroll_pack = scroll_pack.clone();
         btn_add.set_callback(move |_| {
             let mut cfg = state.lock().unwrap();
-            cfg.dials.push(DialConfig { dial_type: "system".to_string(), process_name: None });
+            
+            let mut current_dials = Vec::new();
+            for i in 0..scroll_pack.children() {
+                if let Some(row) = scroll_pack.child(i) {
+                    if let Some(node) = row.as_group() {
+                        if node.children() >= 4 { 
+                            let c_type = unsafe { Choice::from_widget_ptr(node.child(1).unwrap().as_widget_ptr()) };
+                            let c_proc = unsafe { Choice::from_widget_ptr(node.child(2).unwrap().as_widget_ptr()) };
+                            let c_inv = unsafe { CheckButton::from_widget_ptr(node.child(3).unwrap().as_widget_ptr()) };
+                            
+                            let t_str = match c_type.value() { 
+                                1 => "process", 
+                                2 => "all_others", 
+                                _ => "system" 
+                            }.to_string();
+                            
+                            let p_str = if c_proc.active() { c_proc.choice() } else { None };
+                            
+                            current_dials.push(DialConfig { 
+                                dial_type: t_str, 
+                                process_name: p_str,
+                                inverted: c_inv.value()
+                            });
+                        }
+                    }
+                }
+            }
+            cfg.dials = current_dials;
+            cfg.dials.push(DialConfig { dial_type: "system".to_string(), process_name: None, inverted: false });
             let procs = AudioScanner::get_active_sessions();
             refresh_knobs_ui(&mut scroll_pack, &cfg.dials, &procs);
         });
@@ -732,12 +767,19 @@ fn build_gui_and_run(config_path: PathBuf) -> Result<()> {
             for i in 0..scroll_pack.children() {
                 if let Some(row) = scroll_pack.child(i) {
                     if let Some(node) = row.as_group() {
-                        if node.children() >= 3 {
+                        if node.children() >= 4 { 
                             let c_type = unsafe { Choice::from_widget_ptr(node.child(1).unwrap().as_widget_ptr()) };
                             let c_proc = unsafe { Choice::from_widget_ptr(node.child(2).unwrap().as_widget_ptr()) };
+                            let c_inv = unsafe { CheckButton::from_widget_ptr(node.child(3).unwrap().as_widget_ptr()) };
+                            
                             let t_str = match c_type.value() { 1 => "process", 2 => "all_others", _ => "system" }.to_string();
                             let p_str = if c_proc.active() { c_proc.choice() } else { None };
-                            new_dials.push(DialConfig { dial_type: t_str, process_name: p_str });
+                            
+                            new_dials.push(DialConfig { 
+                                dial_type: t_str, 
+                                process_name: p_str,
+                                inverted: c_inv.value()
+                            });
                         }
                     }
                 }
