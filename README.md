@@ -48,9 +48,7 @@ to the SoundVolumeView.exe in the mapping.json file!
 
 
 ## Upcoming features and bugfixes
-
-- Fixing a bug causing duplication of knob mappings when deleting and adding a mapping
-- Implementing an "invert" toggle per knob
+- Proper GUI scaling, instead of a fixed size
 - THT PCB for simple setups
 
 
