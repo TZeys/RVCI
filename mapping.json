@@ -1,33 +1,38 @@
 {
   "serial": {
-    "port": "COM4",
+    "port": "COM7",
     "baud": 9600,
     "timeout": 1
   },
   "value_max": 1024.0,
   "soundvolumeview_path": "C:\\Audio\\pythontest\\SoundVolumeView.exe",
   "work_device_1": "NVIDIA High Definition Audio",
-  "work_device_2": "Headphones (6- M-Audio AIR 192 4)",
+  "work_device_2": "7- AIR 192 4",
   "dials": [
     {
       "type": "system",
-      "process_name": null
+      "process_name": null,
+      "inverted": false
     },
     {
       "type": "process",
-      "process_name": "brave.exe"
+      "process_name": "brave.exe",
+      "inverted": false
     },
     {
       "type": "process",
-      "process_name": null
+      "process_name": null,
+      "inverted": false
     },
     {
       "type": "all_others",
-      "process_name": null
+      "process_name": null,
+      "inverted": false
     },
     {
       "type": "process",
-      "process_name": null
+      "process_name": null,
+      "inverted": false
     }
   ]
 }
