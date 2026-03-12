@@ -43,10 +43,11 @@ to the SoundVolumeView.exe in the mapping.json file!
 2. Please flash the firmware.ino found in the repo onto your Arduino Nano, otherwise the companion app won't work
 
 ## Schematic
-Without Mute Buttons:
+**Without Mute Buttons:**
+
 <img width="800" height="250" alt="image" src="https://github.com/user-attachments/assets/0705bf48-d2b6-495b-8a2f-7d2ab18cc0a7" />
 
-With Mute Buttons:
+**With Mute Buttons:**
 
 <img width="800" height="250" alt="image" src="https://github.com/user-attachments/assets/4a55e12b-b331-46dd-9bd1-0a4c260ff85b" />
 
