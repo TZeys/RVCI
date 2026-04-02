@@ -15,6 +15,7 @@ dependencies = [
  "serialport",
  "tray-icon",
  "windows",
+ "windows-core",
  "winreg",
  "winres",
 ]

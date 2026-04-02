@@ -15,6 +15,7 @@ winreg = "0.52"
 dirs = "6.0.0"
 
 [target.'cfg(windows)'.dependencies]
+windows-core = "0.62"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Media_Audio",

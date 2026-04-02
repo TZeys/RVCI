@@ -1,4 +1,4 @@
-#![windows_subsystem = "windows"] // comment out for debug terminal
+#![windows_subsystem = "windows"]
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -8,9 +8,8 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use std::process::Command; 
-use std::os::windows::process::CommandExt; 
 use std::collections::HashMap;
+use std::ffi::c_void;
 
 //fltk imports
 use fltk::{
@@ -36,7 +35,7 @@ use tray_icon::{
 };
 
 //WAPI imports
-use windows::core::Interface; 
+use windows::core::{Interface, interface, GUID, PCWSTR, IUnknown, IUnknown_Vtbl}; 
 use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
 use windows::Win32::Media::Audio::*; 
@@ -47,7 +46,24 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 
-const CREATE_NO_WINDOW: u32 = 0x08000000;
+// Undocumented Core Audio Policy Config Interface
+const CLSID_PolicyConfigClient: GUID = GUID::from_u128(0x870af99c_171d_4f9e_af0d_e63df40c2bc9);
+
+#[interface("f8679f50-850a-41cf-9c72-430f290290c8")]
+pub unsafe trait IPolicyConfig: IUnknown {
+    fn GetMixFormat(&self, pszdeviceid: PCWSTR, ppformat: *mut *mut c_void) -> windows::core::HRESULT;
+    fn GetDeviceFormat(&self, pszdeviceid: PCWSTR, bdefault: i32, ppformat: *mut *mut c_void) -> windows::core::HRESULT;
+    fn ResetDeviceFormat(&self, pszdeviceid: PCWSTR) -> windows::core::HRESULT;
+    fn SetDeviceFormat(&self, pszdeviceid: PCWSTR, pformat: *const c_void, pformatext: *const c_void) -> windows::core::HRESULT;
+    fn GetProcessingPeriod(&self, pszdeviceid: PCWSTR, bdefault: i32, pdefaultperiod: *mut i64, pminimumperiod: *mut i64) -> windows::core::HRESULT;
+    fn SetProcessingPeriod(&self, pszdeviceid: PCWSTR, pdefaultperiod: *const i64) -> windows::core::HRESULT;
+    fn GetShareMode(&self, pszdeviceid: PCWSTR, pmode: *mut i32) -> windows::core::HRESULT;
+    fn SetShareMode(&self, pszdeviceid: PCWSTR, mode: i32) -> windows::core::HRESULT;
+    fn GetPropertyValue(&self, pszdeviceid: PCWSTR, bfxenable: i32, pkey: *const c_void, pv: *mut c_void) -> windows::core::HRESULT;
+    fn SetPropertyValue(&self, pszdeviceid: PCWSTR, bfxenable: i32, pkey: *const c_void, pv: *const c_void) -> windows::core::HRESULT;
+    fn SetDefaultEndpoint(&self, pszdeviceid: PCWSTR, role: ERole) -> windows::core::Result<()>;
+    fn SetEndpointVisibility(&self, pszdeviceid: PCWSTR, bvisible: i32) -> windows::core::HRESULT;
+}
 
 //conf
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
@@ -65,7 +81,6 @@ struct DialConfig {
 struct AppConfig {
     serial: SerialConfig,
     value_max: f32,
-    soundvolumeview_path: String,
     work_device_1: String, 
     work_device_2: String, 
     dials: Vec<DialConfig>,
@@ -76,7 +91,6 @@ impl Default for AppConfig {
         Self {
             serial: SerialConfig { port: "COM3".to_string(), baud: 9600, timeout: 50 },
             value_max: 1024.0,
-            soundvolumeview_path: "".to_string(),
             work_device_1: "None".to_string(),
             work_device_2: "None".to_string(),
             dials: vec![],
@@ -241,22 +255,25 @@ impl Smoother {
     }
 }
 
-fn switch_device(svv_path: &str, clean_name: &str) {
+fn switch_device(clean_name: &str) {
     if clean_name == "None" || clean_name.is_empty() { return; }
-    let exe_path = PathBuf::from(svv_path);
-    if !exe_path.exists() { return; }
 
     let all_devices = AudioScanner::get_playback_devices_with_ids();
     let match_result = all_devices.iter()
         .find(|(name, _id)| name.to_lowercase().contains(&clean_name.to_lowercase()));
 
     if let Some((_, real_id)) = match_result {
-        let _ = Command::new(&exe_path)
-            .arg("/SetDefault")
-            .arg(real_id)
-            .arg("all")
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn();
+        unsafe {
+            if let Ok(policy) = CoCreateInstance::<_, IPolicyConfig>(&CLSID_PolicyConfigClient, None, CLSCTX_ALL) {
+                let mut id_utf16: Vec<u16> = real_id.encode_utf16().collect();
+                id_utf16.push(0); 
+                let pcwstr_id = PCWSTR(id_utf16.as_ptr());
+
+                let _ = policy.SetDefaultEndpoint(pcwstr_id, eConsole);
+                let _ = policy.SetDefaultEndpoint(pcwstr_id, eMultimedia);
+                let _ = policy.SetDefaultEndpoint(pcwstr_id, eCommunications);
+            }
+        }
     }
 }
 
@@ -322,10 +339,10 @@ fn run_serial_processing(config: &AppConfig, config_path: &PathBuf, smoothers: &
                 if line.is_empty() { continue; }
                 
                 if line == "WORKS 1" {
-                    switch_device(&config.soundvolumeview_path, &config.work_device_1);
+                    switch_device(&config.work_device_1);
                     continue; 
                 } else if line == "WORKS 2" {
-                    switch_device(&config.soundvolumeview_path, &config.work_device_2);
+                    switch_device(&config.work_device_2);
                     continue;
                 }
 
@@ -792,7 +809,7 @@ fn build_gui_and_run(config_path: PathBuf) -> Result<()> {
     {
         let mut win = win.clone();
         btn_cancel.set_callback(move |_| win.hide());
-    }
+    }\
 
     win.hide();
     loop {
