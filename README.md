@@ -53,7 +53,6 @@ note: these mute buttons function without any changes to the arduino firmware. N
 
 ## Upcoming features and bugfixes
 - Proper GUI scaling, instead of a fixed size
-- THT PCB for simple setups
 
 
 
