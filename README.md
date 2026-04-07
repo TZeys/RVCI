@@ -53,6 +53,6 @@ note: these mute buttons function without any changes to the arduino firmware. N
 
 ## Upcoming features and bugfixes
 - Proper GUI scaling, instead of a fixed size
-
+- Issue causing GUI to not properly display mapped programs if launched while a mapped program is not running
 
 
