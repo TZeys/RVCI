@@ -1,32 +1,37 @@
 {
   "serial": {
-    "port": "COM4",
+    "port": "COM11",
     "baud": 9600,
     "timeout": 1
   },
   "value_max": 1024.0,
-  "work_device_1": "NVIDIA High Definition Audio",
-  "work_device_2": "Headphones (6- M-Audio AIR 192 4)",
+  "work_device_1": "7- AIR 192 4",
+  "work_device_2": "NVIDIA High Definition Audio",
   "dials": [
     {
       "type": "system",
-      "process_name": null
+      "process_name": null,
+      "inverted": false
     },
     {
       "type": "process",
-      "process_name": "brave.exe"
+      "process_name": "brave.exe",
+      "inverted": false
     },
     {
       "type": "process",
-      "process_name": null
+      "process_name": null,
+      "inverted": false
     },
     {
       "type": "all_others",
-      "process_name": null
+      "process_name": null,
+      "inverted": false
     },
     {
       "type": "process",
-      "process_name": null
+      "process_name": "discord.exe",
+      "inverted": false
     }
   ]
 }

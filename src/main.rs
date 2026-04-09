@@ -46,7 +46,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 
-// Undocumented Core Audio Policy Config Interface
+// core audio policy 
 const CLSID_PolicyConfigClient: GUID = GUID::from_u128(0x870af99c_171d_4f9e_af0d_e63df40c2bc9);
 
 #[interface("f8679f50-850a-41cf-9c72-430f290290c8")]
@@ -493,33 +493,49 @@ fn refresh_knobs_ui(scroll_pack: &mut Pack, dials: &Vec<DialConfig>, active_proc
         row.set_pad(10);
         let mut lbl = Frame::default().with_label(&format!("{}:", i + 1));
         lbl.set_label_color(TEXT_COLOR);
+        
         let mut choice_type = Choice::default();
         style_choice(&mut choice_type);
         choice_type.add_choice("System|Process|Others");
         let sel_idx = match dial.dial_type.as_str() { "process" => 1, "all_others" => 2, _ => 0 };
         choice_type.set_value(sel_idx);
+        
         let mut choice_proc = Choice::default();
         style_choice(&mut choice_proc);
+
+        let mut available_choices = active_processes.to_vec();
+        if let Some(pname) = &dial.process_name {
+            if !pname.is_empty() && pname != "None" && !available_choices.contains(pname) {
+                available_choices.push(pname.clone());
+            }
+        }
+        available_choices.sort();
+        available_choices.insert(0, "None".to_string());
+
+        for p in &available_choices { choice_proc.add_choice(p); }
+
         if dial.dial_type == "process" {
             choice_proc.activate();
-            for p in active_processes { choice_proc.add_choice(p); }
-            if let Some(pname) = &dial.process_name {
-                if let Some(idx) = active_processes.iter().position(|x| x == pname) {
-                    choice_proc.set_value(idx as i32);
-                }
+            let target = dial.process_name.as_deref().unwrap_or("None");
+            if let Some(idx) = available_choices.iter().position(|x| x == target) {
+                choice_proc.set_value(idx as i32);
+            } else {
+                choice_proc.set_value(0); 
             }
         } else {
             choice_proc.deactivate();
             choice_proc.set_color(BG_COLOR);
+            choice_proc.set_value(0); 
         }
+
         let mut cp_clone = choice_proc.clone();
-        let active_procs_clone = active_processes.to_vec();
         choice_type.set_callback(move |c| {
             if c.value() == 1 { 
                 cp_clone.activate();
                 cp_clone.set_color(WIDGET_BG);
-                cp_clone.clear();
-                for p in &active_procs_clone { cp_clone.add_choice(p); }
+                if cp_clone.value() < 0 {
+                    cp_clone.set_value(0); 
+                }
             } else {
                 cp_clone.deactivate();
                 cp_clone.set_color(BG_COLOR);
@@ -540,6 +556,7 @@ fn refresh_knobs_ui(scroll_pack: &mut Pack, dials: &Vec<DialConfig>, active_proc
             sp.redraw();
             if let Some(mut p) = sp.parent() { p.redraw(); }
         });
+        
         row.end();
         let _ = row.fixed(&lbl, 30);
         let _ = row.fixed(&check_inv, 50);
@@ -708,7 +725,7 @@ fn build_gui_and_run(config_path: PathBuf) -> Result<()> {
         refresh_knobs_ui(&mut scroll_pack, &cfg.dials, &procs);
     }
 
-    // Callbacks
+    // callbacks
     {
         let mut scroll_pack = scroll_pack.clone();
         let state = state.clone();
@@ -742,7 +759,11 @@ fn build_gui_and_run(config_path: PathBuf) -> Result<()> {
                                 _ => "system" 
                             }.to_string();
                             
-                            let p_str = if c_proc.active() { c_proc.choice() } else { None };
+                            let p_str = if c_proc.active() { 
+                                c_proc.choice().and_then(|val| if val == "None" { None } else { Some(val) })
+                            } else { 
+                                None 
+                            };
                             
                             current_dials.push(DialConfig { 
                                 dial_type: t_str, 
@@ -790,7 +811,12 @@ fn build_gui_and_run(config_path: PathBuf) -> Result<()> {
                             let c_inv = unsafe { CheckButton::from_widget_ptr(node.child(3).unwrap().as_widget_ptr()) };
                             
                             let t_str = match c_type.value() { 1 => "process", 2 => "all_others", _ => "system" }.to_string();
-                            let p_str = if c_proc.active() { c_proc.choice() } else { None };
+                            
+                            let p_str = if c_proc.active() { 
+                                c_proc.choice().and_then(|val| if val == "None" { None } else { Some(val) })
+                            } else { 
+                                None 
+                            };
                             
                             new_dials.push(DialConfig { 
                                 dial_type: t_str, 
@@ -809,7 +835,7 @@ fn build_gui_and_run(config_path: PathBuf) -> Result<()> {
     {
         let mut win = win.clone();
         btn_cancel.set_callback(move |_| win.hide());
-    }\
+    }
 
     win.hide();
     loop {
