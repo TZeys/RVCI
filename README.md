@@ -6,7 +6,7 @@ RVCI (Rust Volume Control Interface) is a hardware-software project which can co
 
 **Showcase**
 
-[Youtube Showcase Video](https://youtu.be/VwW_25K1vdo)
+[Youtube Showcase Video](https://youtu.be/tl9Kyg_MPLU)
 
 
 This project is currently work in progress. Current repo files might or might not work properly. This version includes a fully working GUI, volume control functionality as well as audio output switcher.
