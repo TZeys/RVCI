@@ -45,8 +45,9 @@ use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
 };
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
+use windows::Win32::System::Console::AllocConsole;
 
-// core audio policy 
+// Core Audio Policy Config Interface
 const CLSID_PolicyConfigClient: GUID = GUID::from_u128(0x870af99c_171d_4f9e_af0d_e63df40c2bc9);
 
 #[interface("f8679f50-850a-41cf-9c72-430f290290c8")]
@@ -83,6 +84,8 @@ struct AppConfig {
     value_max: f32,
     work_device_1: String, 
     work_device_2: String, 
+    #[serde(default)]
+    debug_mode: bool,
     dials: Vec<DialConfig>,
 }
 
@@ -93,6 +96,7 @@ impl Default for AppConfig {
             value_max: 1024.0,
             work_device_1: "None".to_string(),
             work_device_2: "None".to_string(),
+            debug_mode: false,
             dials: vec![],
         }
     }
@@ -148,11 +152,35 @@ impl AudioController {
         let device: IMMDevice = enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia)?;
         Ok(device.Activate(CLSCTX_ALL, None)?)
     }
+    
     unsafe fn get_session_manager() -> Result<IAudioSessionManager2> {
         let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
         let device: IMMDevice = enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia)?;
         Ok(device.Activate(CLSCTX_ALL, None)?)
     }
+
+    unsafe fn get_mic_volume(mic_name: &str) -> Result<IAudioEndpointVolume> {
+        let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+        let collection = enumerator.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE)?;
+        let count = collection.GetCount()?;
+        for i in 0..count {
+            if let Ok(item) = collection.Item(i) {
+                if let Ok(store) = item.OpenPropertyStore(STGM_READ) {
+                    if let Ok(prop) = store.GetValue(&PKEY_Device_FriendlyName) {
+                        let pwsz = prop.Anonymous.Anonymous.Anonymous.pwszVal;
+                        if !pwsz.is_null() {
+                            let name = pwsz.to_string().unwrap_or_default();
+                            if name.to_lowercase() == mic_name.to_lowercase() {
+                                return item.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None).map_err(anyhow::Error::from);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Err(anyhow::anyhow!("Microphone not found"))
+    }
+
     fn get_process_name(pid: u32) -> String {
         unsafe {
             if let Ok(handle) = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) {
@@ -196,13 +224,13 @@ impl AudioScanner {
         list
     }
 
-    fn get_playback_devices_with_ids() -> Vec<(String, String)> {
+    fn get_devices_with_ids(data_flow: EDataFlow) -> Vec<(String, String)> {
         let mut devices = Vec::new();
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             let enumerator: Result<IMMDeviceEnumerator, _> = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL);
             if let Ok(enumerator) = enumerator {
-                if let Ok(collection) = enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE) {
+                if let Ok(collection) = enumerator.EnumAudioEndpoints(data_flow, DEVICE_STATE_ACTIVE) {
                     if let Ok(count) = collection.GetCount() {
                         for i in 0..count {
                             if let Ok(item) = collection.Item(i) {
@@ -232,6 +260,14 @@ impl AudioScanner {
         devices
     }
 
+    fn get_playback_devices_with_ids() -> Vec<(String, String)> {
+        Self::get_devices_with_ids(eRender)
+    }
+
+    fn get_capture_devices_with_ids() -> Vec<(String, String)> {
+        Self::get_devices_with_ids(eCapture)
+    }
+
     fn get_com_ports() -> Vec<String> {
         serialport::available_ports()
             .unwrap_or_default()
@@ -257,12 +293,14 @@ impl Smoother {
 
 fn switch_device(clean_name: &str) {
     if clean_name == "None" || clean_name.is_empty() { return; }
+    println!("DEBUG: Attempting to switch output device to -> '{}'", clean_name);
 
     let all_devices = AudioScanner::get_playback_devices_with_ids();
     let match_result = all_devices.iter()
         .find(|(name, _id)| name.to_lowercase().contains(&clean_name.to_lowercase()));
 
-    if let Some((_, real_id)) = match_result {
+    if let Some((found_name, real_id)) = match_result {
+        println!("DEBUG: Found matching device: '{}' (ID: {})", found_name, real_id);
         unsafe {
             if let Ok(policy) = CoCreateInstance::<_, IPolicyConfig>(&CLSID_PolicyConfigClient, None, CLSCTX_ALL) {
                 let mut id_utf16: Vec<u16> = real_id.encode_utf16().collect();
@@ -272,8 +310,13 @@ fn switch_device(clean_name: &str) {
                 let _ = policy.SetDefaultEndpoint(pcwstr_id, eConsole);
                 let _ = policy.SetDefaultEndpoint(pcwstr_id, eMultimedia);
                 let _ = policy.SetDefaultEndpoint(pcwstr_id, eCommunications);
+                println!("DEBUG: Successfully switched to '{}'", found_name);
+            } else {
+                println!("ERROR: Failed to instantiate IPolicyConfig COM object.");
             }
         }
+    } else {
+        println!("ERROR: Could not find playback device matching '{}'", clean_name);
     }
 }
 
@@ -290,9 +333,11 @@ fn run_volume_logic_loop(config_path: PathBuf) {
             let new_sig = format!("{}{}", config.serial.port, config.serial.baud);
             if new_sig != current_config_sig {
                 current_config_sig = new_sig;
+                println!("DEBUG: Serial configuration updated. Target: {} @ {}", config.serial.port, config.serial.baud);
                 smoothers = (0..config.dials.len()).map(|_| Smoother::new()).collect();
             }
-             if let Err(_) = run_serial_processing(&config, &config_path, &mut smoothers) {
+             if let Err(e) = run_serial_processing(&config, &config_path, &mut smoothers) {
+                println!("DEBUG: Serial Connection Error: {}. Retrying in 2 seconds...", e);
                 std::thread::sleep(Duration::from_secs(2));
              }
         } else {
@@ -307,6 +352,8 @@ fn run_serial_processing(config: &AppConfig, config_path: &PathBuf, smoothers: &
         .open()
         .context("Failed to open serial port")?;
     
+    println!("DEBUG: Connected to serial port successfully.");
+    
     let mut reader = BufReader::new(port);
     let mut line_buf = String::new();
     let mut last_update = Instant::now();
@@ -314,6 +361,7 @@ fn run_serial_processing(config: &AppConfig, config_path: &PathBuf, smoothers: &
     let mut last_applied_values: Vec<f32> = vec![-1.0; config.dials.len()];
 
     let mut pid_name_cache: HashMap<u32, String> = HashMap::new();
+    let mut mic_device_cache: HashMap<String, IAudioEndpointVolume> = HashMap::new();
     let mut cache_counter = 0;
 
     let mut process_map: HashSet<String> = HashSet::new();
@@ -352,6 +400,7 @@ fn run_serial_processing(config: &AppConfig, config_path: &PathBuf, smoothers: &
                 cache_counter += 1;
                 if cache_counter > 200 {
                     pid_name_cache.clear();
+                    mic_device_cache.clear(); 
                     cache_counter = 0;
                 }
 
@@ -377,12 +426,32 @@ fn run_serial_processing(config: &AppConfig, config_path: &PathBuf, smoothers: &
                         }
                         
                         last_applied_values[i] = smoothed;
+                        
+                        let target_lbl = dial_cfg.process_name.as_deref().unwrap_or("Unassigned");
+                        println!("DEBUG: [Knob {}] {} ({}) -> {:.3}", i + 1, dial_cfg.dial_type, target_lbl, smoothed);
 
                         unsafe {
                             match dial_cfg.dial_type.as_str() {
                                 "system" => {
                                     if let Ok(vol) = AudioController::get_system_volume() {
                                         let _ = vol.SetMasterVolumeLevelScalar(smoothed, std::ptr::null());
+                                    }
+                                },
+                                "microphone" => {
+                                    if let Some(target) = &dial_cfg.process_name {
+                                        if target != "None" {
+                                            let vol_opt = mic_device_cache.get(target).cloned().or_else(|| {
+                                                if let Ok(v) = AudioController::get_mic_volume(target) {
+                                                    mic_device_cache.insert(target.clone(), v.clone());
+                                                    Some(v)
+                                                } else {
+                                                    None
+                                                }
+                                            });
+                                            if let Some(vol) = vol_opt {
+                                                let _ = vol.SetMasterVolumeLevelScalar(smoothed, std::ptr::null());
+                                            }
+                                        }
                                     }
                                 },
                                 "process" | "all_others" => {
@@ -485,7 +554,7 @@ fn extract_clean_name(full_name: &str) -> String {
     full_name.to_string()
 }
 
-fn refresh_knobs_ui(scroll_pack: &mut Pack, dials: &Vec<DialConfig>, active_processes: &[String]) {
+fn refresh_knobs_ui(scroll_pack: &mut Pack, dials: &Vec<DialConfig>, active_processes: &[String], capture_devices: &[String]) {
     scroll_pack.clear(); 
     scroll_pack.begin();
     for (i, dial) in dials.iter().enumerate() {
@@ -496,14 +565,27 @@ fn refresh_knobs_ui(scroll_pack: &mut Pack, dials: &Vec<DialConfig>, active_proc
         
         let mut choice_type = Choice::default();
         style_choice(&mut choice_type);
-        choice_type.add_choice("System|Process|Others");
-        let sel_idx = match dial.dial_type.as_str() { "process" => 1, "all_others" => 2, _ => 0 };
+        choice_type.add_choice("System|Process|Others|Microphone");
+        
+        let sel_idx = match dial.dial_type.as_str() { 
+            "process" => 1, 
+            "all_others" => 2, 
+            "microphone" => 3,
+            _ => 0 
+        };
         choice_type.set_value(sel_idx);
         
         let mut choice_proc = Choice::default();
         style_choice(&mut choice_proc);
 
-        let mut available_choices = active_processes.to_vec();
+
+        let mut available_choices = match dial.dial_type.as_str() {
+            "process" => active_processes.to_vec(),
+            "microphone" => capture_devices.to_vec(),
+            _ => Vec::new(),
+        };
+
+
         if let Some(pname) = &dial.process_name {
             if !pname.is_empty() && pname != "None" && !available_choices.contains(pname) {
                 available_choices.push(pname.clone());
@@ -512,9 +594,10 @@ fn refresh_knobs_ui(scroll_pack: &mut Pack, dials: &Vec<DialConfig>, active_proc
         available_choices.sort();
         available_choices.insert(0, "None".to_string());
 
+
         for p in &available_choices { choice_proc.add_choice(p); }
 
-        if dial.dial_type == "process" {
+        if dial.dial_type == "process" || dial.dial_type == "microphone" {
             choice_proc.activate();
             let target = dial.process_name.as_deref().unwrap_or("None");
             if let Some(idx) = available_choices.iter().position(|x| x == target) {
@@ -529,16 +612,28 @@ fn refresh_knobs_ui(scroll_pack: &mut Pack, dials: &Vec<DialConfig>, active_proc
         }
 
         let mut cp_clone = choice_proc.clone();
+        let active_procs_clone = active_processes.to_vec();
+        let capture_devices_clone = capture_devices.to_vec();
+        
         choice_type.set_callback(move |c| {
             if c.value() == 1 { 
                 cp_clone.activate();
                 cp_clone.set_color(WIDGET_BG);
-                if cp_clone.value() < 0 {
-                    cp_clone.set_value(0); 
-                }
+                cp_clone.clear();
+                cp_clone.add_choice("None");
+                for p in &active_procs_clone { cp_clone.add_choice(p); }
+                if cp_clone.value() < 0 { cp_clone.set_value(0); }
+            } else if c.value() == 3 {
+                cp_clone.activate();
+                cp_clone.set_color(WIDGET_BG);
+                cp_clone.clear();
+                cp_clone.add_choice("None");
+                for p in &capture_devices_clone { cp_clone.add_choice(p); }
+                if cp_clone.value() < 0 { cp_clone.set_value(0); }
             } else {
                 cp_clone.deactivate();
                 cp_clone.set_color(BG_COLOR);
+                cp_clone.set_value(0);
             }
         });
 
@@ -604,11 +699,12 @@ fn build_gui_and_run(config_path: PathBuf) -> Result<()> {
         .with_icon(load_tray_icon("rvci.ico"))
         .build()?;
 
-    let mut win = Window::default().with_size(420, 720).with_label("RVCI Configuration");
+    let mut win = Window::default().with_size(440, 720).with_label("RVCI Configuration");
+    win.make_resizable(true);
     if let Some(ref ico) = taskbar_icon { win.set_icon(Some(ico.clone())); }
     win.set_color(BG_COLOR);
     
-    let mut col = Flex::default().column().with_size(420, 720).center_of_parent();
+    let mut col = Flex::default_fill().column();
     col.set_margin(15);
     col.set_pad(10);
 
@@ -662,19 +758,25 @@ fn build_gui_and_run(config_path: PathBuf) -> Result<()> {
 
     let mut scroll = Scroll::default();
     scroll.set_color(BG_COLOR);
-    let mut scroll_pack = Pack::default().with_size(380, 0); 
+    let mut scroll_pack = Pack::default().with_size(400, 0); 
     scroll_pack.set_spacing(5);
     scroll_pack.end();
     scroll.end();
 
-    let row_footer = Flex::default().row(); 
+    let mut row_footer = Flex::default().row(); 
     let mut check_startup = CheckButton::default().with_label("Launch on Startup");
     check_startup.set_label_color(TEXT_COLOR);
     if check_startup_enabled() { check_startup.set_value(true); }
+    
+    let mut check_debug = CheckButton::default().with_label("Debug Mode");
+    check_debug.set_label_color(TEXT_COLOR);
+
     let mut lbl_credits = Frame::default().with_label("Made by TZey");
     lbl_credits.set_label_size(12);
     lbl_credits.set_label_color(Color::from_rgb(150, 150, 150));
     row_footer.end();
+    let _ = row_footer.fixed(&check_startup, 150);
+    let _ = row_footer.fixed(&check_debug, 110);
 
     let row_btns = Flex::default().row(); 
     let mut btn_apply = Button::default().with_label("Apply"); 
@@ -721,11 +823,14 @@ fn build_gui_and_run(config_path: PathBuf) -> Result<()> {
         if let Some(idx) = [9600, 19200, 38400, 57600, 115200].iter().position(|&x| x == cfg.serial.baud) {
              choice_baud.set_value(idx as i32);
         }
+        check_debug.set_value(cfg.debug_mode);
+
         let procs = AudioScanner::get_active_sessions();
-        refresh_knobs_ui(&mut scroll_pack, &cfg.dials, &procs);
+        let capture_devices: Vec<String> = AudioScanner::get_capture_devices_with_ids().into_iter().map(|d| d.0).collect();
+        refresh_knobs_ui(&mut scroll_pack, &cfg.dials, &procs, &capture_devices);
     }
 
-    // callbacks
+    // Callbacks
     {
         let mut scroll_pack = scroll_pack.clone();
         let state = state.clone();
@@ -734,7 +839,8 @@ fn build_gui_and_run(config_path: PathBuf) -> Result<()> {
             refresh_logic();
             let cfg = state.lock().unwrap();
             let procs = AudioScanner::get_active_sessions();
-            refresh_knobs_ui(&mut scroll_pack, &cfg.dials, &procs);
+            let capture_devices: Vec<String> = AudioScanner::get_capture_devices_with_ids().into_iter().map(|d| d.0).collect();
+            refresh_knobs_ui(&mut scroll_pack, &cfg.dials, &procs, &capture_devices);
         });
     }
 
@@ -756,6 +862,7 @@ fn build_gui_and_run(config_path: PathBuf) -> Result<()> {
                             let t_str = match c_type.value() { 
                                 1 => "process", 
                                 2 => "all_others", 
+                                3 => "microphone",
                                 _ => "system" 
                             }.to_string();
                             
@@ -777,7 +884,8 @@ fn build_gui_and_run(config_path: PathBuf) -> Result<()> {
             cfg.dials = current_dials;
             cfg.dials.push(DialConfig { dial_type: "system".to_string(), process_name: None, inverted: false });
             let procs = AudioScanner::get_active_sessions();
-            refresh_knobs_ui(&mut scroll_pack, &cfg.dials, &procs);
+            let capture_devices: Vec<String> = AudioScanner::get_capture_devices_with_ids().into_iter().map(|d| d.0).collect();
+            refresh_knobs_ui(&mut scroll_pack, &cfg.dials, &procs, &capture_devices);
         });
     }
 
@@ -789,6 +897,7 @@ fn build_gui_and_run(config_path: PathBuf) -> Result<()> {
         let choice_wd1 = choice_wd1.clone();
         let choice_wd2 = choice_wd2.clone();
         let check_startup = check_startup.clone();
+        let check_debug = check_debug.clone();
         let path = config_path.clone();
         
         btn_apply.set_callback(move |_| {
@@ -801,6 +910,8 @@ fn build_gui_and_run(config_path: PathBuf) -> Result<()> {
             if let Some(s) = choice_wd1.choice() { cfg.work_device_1 = extract_clean_name(&s); }
             if let Some(s) = choice_wd2.choice() { cfg.work_device_2 = extract_clean_name(&s); }
             
+            cfg.debug_mode = check_debug.value();
+
             let mut new_dials = Vec::new();
             for i in 0..scroll_pack.children() {
                 if let Some(row) = scroll_pack.child(i) {
@@ -810,7 +921,12 @@ fn build_gui_and_run(config_path: PathBuf) -> Result<()> {
                             let c_proc = unsafe { Choice::from_widget_ptr(node.child(2).unwrap().as_widget_ptr()) };
                             let c_inv = unsafe { CheckButton::from_widget_ptr(node.child(3).unwrap().as_widget_ptr()) };
                             
-                            let t_str = match c_type.value() { 1 => "process", 2 => "all_others", _ => "system" }.to_string();
+                            let t_str = match c_type.value() { 
+                                1 => "process", 
+                                2 => "all_others", 
+                                3 => "microphone",
+                                _ => "system" 
+                            }.to_string();
                             
                             let p_str = if c_proc.active() { 
                                 c_proc.choice().and_then(|val| if val == "None" { None } else { Some(val) })
@@ -845,7 +961,8 @@ fn build_gui_and_run(config_path: PathBuf) -> Result<()> {
                 refresh_all_data();
                 let cfg = state.lock().unwrap();
                 let procs = AudioScanner::get_active_sessions();
-                refresh_knobs_ui(&mut scroll_pack, &cfg.dials, &procs);
+                let capture_devices: Vec<String> = AudioScanner::get_capture_devices_with_ids().into_iter().map(|d| d.0).collect();
+                refresh_knobs_ui(&mut scroll_pack, &cfg.dials, &procs, &capture_devices);
                 win.show();
             } else if event.id == quit_id { app.quit(); break; }
         }
@@ -854,7 +971,8 @@ fn build_gui_and_run(config_path: PathBuf) -> Result<()> {
                 refresh_all_data();
                 let cfg = state.lock().unwrap();
                 let procs = AudioScanner::get_active_sessions();
-                refresh_knobs_ui(&mut scroll_pack, &cfg.dials, &procs);
+                let capture_devices: Vec<String> = AudioScanner::get_capture_devices_with_ids().into_iter().map(|d| d.0).collect();
+                refresh_knobs_ui(&mut scroll_pack, &cfg.dials, &procs, &capture_devices);
                 win.show();
              }
         }
@@ -865,6 +983,27 @@ fn build_gui_and_run(config_path: PathBuf) -> Result<()> {
 
 fn main() -> Result<()> {
     let path = get_config_path();
+
+    // debug mode
+    let debug_mode_enabled = if let Ok(file) = File::open(&path) {
+        let config: AppConfig = serde_json::from_reader(BufReader::new(file)).unwrap_or_default();
+        config.debug_mode
+    } else {
+        false
+    };
+
+    if debug_mode_enabled {
+        unsafe {
+            
+            let _ = AllocConsole();
+        }
+        println!("==========================================");
+        println!(" RVCI Debug Console Initialized");
+        println!(" Close this window to kill the app completely");
+        println!(" Uncheck 'Debug Mode' in settings to disable");
+        println!("==========================================");
+    }
+
     let path_clone = path.clone();
     std::thread::spawn(move || { run_volume_logic_loop(path_clone); });
     build_gui_and_run(path)
