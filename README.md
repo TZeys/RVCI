@@ -52,6 +52,8 @@ note: these mute buttons function without any changes to the arduino firmware. N
 
 
 ## Upcoming features and bugfixes
-- None currently
+- OSD Overlay for seeing volume changes i.e while gaming in fullscreen
+- More modern GUI
+- Firmware improvements such as variable jitter and noise compensation
 
 
