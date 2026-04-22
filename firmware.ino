@@ -1,93 +1,89 @@
 #include <Arduino.h>
-#include <Keyboard.h>
-
-//#ifdef __cplusplus
-//extern "C" {
-//#endif
-//void setup();
-//void loop();
-//#ifdef __cplusplus
-//}
-//#endif
 
 void updateSliderValues();
 void sendSliderValues();
 
 const int NUM_SLIDERS = 5;
 const int analogInputs[NUM_SLIDERS] = {A1, A2, A3, A4, A5};
-const int switchPin2 = 7; // Pin for switch 2
-const int switchPin3 = 6; // Pin for switch 3
+const int switchPin1 = 6; 
+const int switchPin2 = 7; 
 
 int analogSliderValues[NUM_SLIDERS];
-int prevSwitchState2 = LOW;
-int prevSwitchState3 = LOW;
+float smoothedValues[NUM_SLIDERS];
+
+// ==========================================
+// CONFIGURABLE FILTERING VARIABLES
+// ==========================================
+// 0.01 to 1.0. Lower = smoother/slower. Higher = snappier/noisier.
+const float SMOOTHING_FACTOR = 0.15; 
+
+// Increase incase of jittery output
+const int NOISE_GATE = 12; 
+
+// Deadzone Compensation: adjust these if you can't reach 0% or 100% volume.
+const int MIN_VAL = 15;    
+const int MAX_VAL = 1010;  
+// ==========================================
+
+int prevSwitchState1 = HIGH;
+int prevSwitchState2 = HIGH;
 
 void setup() {
+  pinMode(switchPin1, INPUT_PULLUP);
   pinMode(switchPin2, INPUT_PULLUP);
-  pinMode(switchPin3, INPUT_PULLUP);
+  
   for (int i = 0; i < NUM_SLIDERS; i++) {
     pinMode(analogInputs[i], INPUT);
+    int startRead = analogRead(analogInputs[i]);
+    smoothedValues[i] = startRead;
+    analogSliderValues[i] = map(startRead, MIN_VAL, MAX_VAL, 0, 1023);
   }
 
-  Serial.begin(9600);
+  Serial.begin(115200); 
 }
 
 void loop() {
   updateSliderValues();
-  delay(20);
-  sendSliderValues(); // Actually send data (all the time)
-  delay(100);
-  int switchState2 = digitalRead(switchPin2);
-  int switchState3 = digitalRead(switchPin3);
-  // printSliderValues(); // For debug
- if (switchState2 != prevSwitchState2) {
-    if (switchState2 == HIGH) {
-      Serial.println("WORKS 2");
-    }
-    prevSwitchState2 = switchState2;
-    delay(50); // Debounce delay
-  }
+  sendSliderValues();
 
-  // Check for switch 3 state change
-  if (switchState3 != prevSwitchState3) {
-    if (switchState3 == HIGH) {
-      Serial.println("WORKS 1");
-    }
-    prevSwitchState3 = switchState3;
-    delay(50); // Debounce delay
-  }
-  delay(20);
+  // Switch Logic 
+  int s1 = digitalRead(switchPin1);
+  int s2 = digitalRead(switchPin2);
+  if (s1 == LOW && prevSwitchState1 == HIGH) { Serial.println("WORKS 1"); delay(50); }
+  prevSwitchState1 = s1;
+  if (s2 == LOW && prevSwitchState2 == HIGH) { Serial.println("WORKS 2"); delay(50); }
+  prevSwitchState2 = s2;
+
+  delay(15); 
 }
 
 void updateSliderValues() {
   for (int i = 0; i < NUM_SLIDERS; i++) {
-     analogSliderValues[i] = analogRead(analogInputs[i]);
+    int raw = analogRead(analogInputs[i]);
+    
+    // exponential moving average smoothing
+    smoothedValues[i] = (smoothedValues[i] * (1.0 - SMOOTHING_FACTOR)) + (raw * SMOOTHING_FACTOR);
+
+    // value mapping
+    int currentMapped = constrain(map((int)smoothedValues[i], MIN_VAL, MAX_VAL, 0, 1023), 0, 1023);
+
+    //noise gate
+    if (abs(currentMapped - analogSliderValues[i]) > NOISE_GATE) {
+      analogSliderValues[i] = currentMapped;
+    }
+    
+    if (currentMapped < 8) analogSliderValues[i] = 0;
+    if (currentMapped > 1015) analogSliderValues[i] = 1023;
   }
 }
 
 void sendSliderValues() {
-  String builtString = String("");
-
+  String builtString = "";
   for (int i = 0; i < NUM_SLIDERS; i++) {
-    builtString += String((int)analogSliderValues[i]);
-
+    builtString += String(analogSliderValues[i]);
     if (i < NUM_SLIDERS - 1) {
-      builtString += String("|");
+      builtString += "|";
     }
   }
-  
- Serial.println(builtString);
-}
-
-void printSliderValues() {
-  for (int i = 0; i < NUM_SLIDERS; i++) {
-    String printedString = String("Slider #") + String(i + 1) + String(": ") + String(analogSliderValues[i]) + String(" mV");
-    Serial.write(printedString.c_str());
-
-    if (i < NUM_SLIDERS - 1) {
-      Serial.write(" | ");
-    } else {
-      Serial.write("\n");
-    }
-  }
+  Serial.println(builtString);
 }

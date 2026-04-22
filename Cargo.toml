@@ -12,11 +12,9 @@ tray-icon = "0.19"
 fltk = { version = "^1.4", features = ["fltk-bundled"] }
 winreg = "0.52"
 dirs = "6.0.0"
-
-
 image = { version = "0.25", default-features = false, features = ["ico"] }
 
-[target.'cfg(windows)'.dependencies]
+# Moved these out of the [target] block!
 windows-core = "0.62"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
@@ -29,16 +27,16 @@ windows = { version = "0.62", features = [
     "Win32_System_ProcessStatus",
     "Win32_Devices_FunctionDiscovery",
     "Win32_UI_Shell_PropertiesSystem",
-    "Win32_System_Console"
+    "Win32_System_Console",
+    "Win32_System_LibraryLoader"
 ] }
 
 [build-dependencies]
 winres = "0.1"
-
 
 [profile.release]
 opt-level = "z"     
 lto = true          
 codegen-units = 1  
 strip = true        
-panic = "abort"    
+panic = "abort"

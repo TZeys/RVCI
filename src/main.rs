@@ -15,10 +15,11 @@ use std::ffi::c_void;
 use fltk::{
     app,
     button::{Button, CheckButton},
-    enums::{Color, FrameType},
+    enums::{Color, FrameType, Font},
     frame::Frame,
     group::{Flex, Pack, Scroll},
     menu::Choice,
+    misc::Progress,
     prelude::*,
     window::Window,
     image::RgbImage, 
@@ -35,7 +36,7 @@ use tray_icon::{
 };
 
 //WAPI imports
-use windows::core::{Interface, interface, GUID, PCWSTR, IUnknown, IUnknown_Vtbl}; 
+use windows::core::{Interface, interface, GUID, PCWSTR, PCSTR, IUnknown, IUnknown_Vtbl}; 
 use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
 use windows::Win32::Media::Audio::*; 
@@ -44,10 +45,60 @@ use windows::Win32::System::ProcessStatus::GetModuleBaseNameW;
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
 };
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::System::Console::AllocConsole;
 
-// Core Audio Policy Config Interface
+#[link(name = "dwmapi")]
+extern "system" {
+    fn DwmSetWindowAttribute(
+        hwnd: *mut c_void,
+        dwAttribute: u32,
+        pvAttribute: *const c_void,
+        cbAttribute: u32,
+    ) -> i32;
+}
+
+const DWMWA_USE_IMMERSIVE_DARK_MODE_WIN11: u32 = 20;
+const DWMWA_USE_IMMERSIVE_DARK_MODE_WIN10: u32 = 19;
+const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
+const DWMWCP_ROUND: u32 = 2; 
+
+#[link(name = "user32")]
+extern "system" {
+    fn SetWindowPos(hWnd: *mut c_void, hWndInsertAfter: *mut c_void, X: i32, Y: i32, cx: i32, cy: i32, uFlags: u32) -> i32;
+    fn SetLayeredWindowAttributes(hwnd: *mut c_void, crKey: u32, bAlpha: u8, dwFlags: u32) -> i32;
+
+    #[cfg(target_arch = "x86_64")]
+    fn GetWindowLongPtrW(hWnd: *mut c_void, nIndex: i32) -> isize;
+    #[cfg(target_arch = "x86_64")]
+    fn SetWindowLongPtrW(hWnd: *mut c_void, nIndex: i32, dwNewLong: isize) -> isize;
+
+    #[cfg(target_arch = "x86")]
+    fn GetWindowLongW(hWnd: *mut c_void, nIndex: i32) -> isize;
+    #[cfg(target_arch = "x86")]
+    fn SetWindowLongW(hWnd: *mut c_void, nIndex: i32, dwNewLong: isize) -> isize;
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn get_win_long(hwnd: *mut c_void, idx: i32) -> isize { GetWindowLongPtrW(hwnd, idx) }
+#[cfg(target_arch = "x86_64")]
+unsafe fn set_win_long(hwnd: *mut c_void, idx: i32, val: isize) -> isize { SetWindowLongPtrW(hwnd, idx, val) }
+
+#[cfg(target_arch = "x86")]
+unsafe fn get_win_long(hwnd: *mut c_void, idx: i32) -> isize { GetWindowLongW(hwnd, idx) }
+#[cfg(target_arch = "x86")]
+unsafe fn set_win_long(hwnd: *mut c_void, idx: i32, val: i32) -> isize { SetWindowLongW(hwnd, idx, val as isize) }
+
+const HWND_TOPMOST: isize = -1;
+const SWP_NOSIZE: u32 = 0x0001;
+const SWP_NOMOVE: u32 = 0x0002;
+const GWL_EXSTYLE: i32 = -20;
+const WS_EX_LAYERED: isize = 0x00080000;
+const WS_EX_TRANSPARENT: isize = 0x00000020;
+const LWA_COLORKEY: u32 = 0x00000001;
+const LWA_ALPHA: u32 = 0x00000002;
+
 const CLSID_PolicyConfigClient: GUID = GUID::from_u128(0x870af99c_171d_4f9e_af0d_e63df40c2bc9);
 
 #[interface("f8679f50-850a-41cf-9c72-430f290290c8")]
@@ -66,7 +117,8 @@ pub unsafe trait IPolicyConfig: IUnknown {
     fn SetEndpointVisibility(&self, pszdeviceid: PCWSTR, bvisible: i32) -> windows::core::HRESULT;
 }
 
-//conf
+fn default_true() -> bool { true }
+
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 struct SerialConfig { port: String, baud: u32, timeout: u64 }
 
@@ -86,23 +138,27 @@ struct AppConfig {
     work_device_2: String, 
     #[serde(default)]
     debug_mode: bool,
+    #[serde(default)]
+    use_logarithmic_scale: bool,
+    #[serde(default = "default_true")] 
+    enable_osd: bool,
     dials: Vec<DialConfig>,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            serial: SerialConfig { port: "COM3".to_string(), baud: 9600, timeout: 50 },
+            serial: SerialConfig { port: "COM3".to_string(), baud: 115200, timeout: 50 },
             value_max: 1024.0,
             work_device_1: "None".to_string(),
             work_device_2: "None".to_string(),
             debug_mode: false,
+            use_logarithmic_scale: false,
+            enable_osd: true,
             dials: vec![],
         }
     }
 }
-
-//path
 
 fn get_exe_dir() -> PathBuf {
     std::env::current_exe().map(|p| p.parent().map(|p| p.to_path_buf()).unwrap_or(p)).unwrap_or_else(|_| PathBuf::from("."))
@@ -111,13 +167,9 @@ fn get_exe_dir() -> PathBuf {
 fn get_config_path() -> PathBuf {
     let mut path = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
     path.push("RVCI");
-    if !path.exists() {
-        let _ = std::fs::create_dir_all(&path);
-    }
+    if !path.exists() { let _ = std::fs::create_dir_all(&path); }
     path.join("mapping.json")
 }
-
-//reg
 
 fn set_startup_launch(enable: bool) -> Result<()> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
@@ -142,8 +194,6 @@ fn check_startup_enabled() -> bool {
     }
     false
 }
-
-//audio methods
 
 struct AudioController;
 impl AudioController {
@@ -187,7 +237,13 @@ impl AudioController {
                 let mut buffer = [0u16; 1024];
                 let len = GetModuleBaseNameW(handle, None, &mut buffer);
                 let _ = CloseHandle(handle);
-                if len > 0 { return String::from_utf16_lossy(&buffer[..len as usize]).to_lowercase(); }
+                if len > 0 { 
+                    let mut name = String::from_utf16_lossy(&buffer[..len as usize]).to_string(); 
+                    if name.to_lowercase().ends_with(".exe") {
+                        name.truncate(name.len() - 4);
+                    }
+                    return name; 
+                }
             }
         }
         String::new()
@@ -277,8 +333,6 @@ impl AudioScanner {
     }
 }
 
-//logic loop
-
 struct Smoother { last_value: f32 }
 impl Smoother {
     fn new() -> Self { Self { last_value: 0.0 } }
@@ -320,7 +374,7 @@ fn switch_device(clean_name: &str) {
     }
 }
 
-fn run_volume_logic_loop(config_path: PathBuf) {
+fn run_volume_logic_loop(config_path: PathBuf, osd_tx: app::Sender<(String, f32)>) {
     let mut current_config_sig = String::new(); 
     let mut smoothers: Vec<Smoother> = Vec::new();
     loop {
@@ -336,7 +390,7 @@ fn run_volume_logic_loop(config_path: PathBuf) {
                 println!("DEBUG: Serial configuration updated. Target: {} @ {}", config.serial.port, config.serial.baud);
                 smoothers = (0..config.dials.len()).map(|_| Smoother::new()).collect();
             }
-             if let Err(e) = run_serial_processing(&config, &config_path, &mut smoothers) {
+             if let Err(e) = run_serial_processing(&config, &config_path, &mut smoothers, &osd_tx) {
                 println!("DEBUG: Serial Connection Error: {}. Retrying in 2 seconds...", e);
                 std::thread::sleep(Duration::from_secs(2));
              }
@@ -346,7 +400,7 @@ fn run_volume_logic_loop(config_path: PathBuf) {
     }
 }
 
-fn run_serial_processing(config: &AppConfig, config_path: &PathBuf, smoothers: &mut Vec<Smoother>) -> Result<()> {
+fn run_serial_processing(config: &AppConfig, config_path: &PathBuf, smoothers: &mut Vec<Smoother>, osd_tx: &app::Sender<(String, f32)>) -> Result<()> {
     let port = serialport::new(&config.serial.port, config.serial.baud)
         .timeout(Duration::from_millis(config.serial.timeout))
         .open()
@@ -366,7 +420,13 @@ fn run_serial_processing(config: &AppConfig, config_path: &PathBuf, smoothers: &
 
     let mut process_map: HashSet<String> = HashSet::new();
     for dial in &config.dials {
-        if let Some(name) = &dial.process_name { process_map.insert(name.to_lowercase()); }
+        if let Some(name) = &dial.process_name { 
+            let mut clean_name = name.clone();
+            if clean_name.to_lowercase().ends_with(".exe") {
+                clean_name.truncate(clean_name.len() - 4);
+            }
+            process_map.insert(clean_name.to_lowercase()); 
+        }
     }
     
     unsafe { let _ = CoInitializeEx(None, COINIT_MULTITHREADED); }
@@ -410,10 +470,15 @@ fn run_serial_processing(config: &AppConfig, config_path: &PathBuf, smoothers: &
                 for (i, part) in parts.iter().enumerate() {
                     if let Ok(raw_val) = part.parse::<f32>() {
                         let dial_cfg = &config.dials[i];
+                        
                         let mut normalized = raw_val.clamp(0.0, config.value_max) / config.value_max;
                         
                         if dial_cfg.inverted {
                             normalized = 1.0 - normalized;
+                        }
+
+                        if config.use_logarithmic_scale {
+                            normalized = normalized.powf(3.0);
                         }
                         
                         if i >= smoothers.len() { smoothers.push(Smoother::new()); }
@@ -429,6 +494,23 @@ fn run_serial_processing(config: &AppConfig, config_path: &PathBuf, smoothers: &
                         
                         let target_lbl = dial_cfg.process_name.as_deref().unwrap_or("Unassigned");
                         println!("DEBUG: [Knob {}] {} ({}) -> {:.3}", i + 1, dial_cfg.dial_type, target_lbl, smoothed);
+
+                        if config.enable_osd {
+                            let display_name = match dial_cfg.dial_type.as_str() {
+                                "system" => "Master Volume".to_string(),
+                                "all_others" => "Other Apps".to_string(),
+                                _ => {
+                                    let mut clean = target_lbl.to_string();
+                                    if clean.to_lowercase().ends_with(".exe") {
+                                        clean.truncate(clean.len() - 4);
+                                    }
+                                    clean
+                                }
+                            };
+                            if display_name != "None" && display_name != "Unassigned" {
+                                osd_tx.send((display_name, smoothed));
+                            }
+                        }
 
                         unsafe {
                             match dial_cfg.dial_type.as_str() {
@@ -469,10 +551,16 @@ fn run_serial_processing(config: &AppConfig, config_path: &PathBuf, smoothers: &
                                                                 });
 
                                                                 let should_change = if dial_cfg.dial_type == "all_others" {
-                                                                    !process_map.contains(pname)
+                                                                    !process_map.contains(&pname.to_lowercase())
                                                                 } else {
                                                                     match &dial_cfg.process_name {
-                                                                        Some(target) => pname == &target.to_lowercase(),
+                                                                        Some(target) => {
+                                                                            let mut clean_target = target.clone();
+                                                                            if clean_target.to_lowercase().ends_with(".exe") {
+                                                                                clean_target.truncate(clean_target.len() - 4);
+                                                                            }
+                                                                            pname.to_lowercase() == clean_target.to_lowercase()
+                                                                        },
                                                                         None => false,
                                                                     }
                                                                 };
@@ -504,23 +592,29 @@ fn run_serial_processing(config: &AppConfig, config_path: &PathBuf, smoothers: &
     }
 }
 
-//GUI Rendering
 
-const BG_COLOR: Color = Color::from_rgb(1, 1, 1);      
-const WIDGET_BG: Color = Color::from_rgb(40, 40, 40);     
-const TEXT_COLOR: Color = Color::White;
+const WIDGET_BG: Color = Color::from_rgb(28, 28, 30);             
+const WIDGET_HOVER: Color = Color::from_rgb(44, 44, 46);         
+const TEXT_COLOR: Color = Color::from_rgb(255, 255, 255);        
+const ACCENT_COLOR: Color = Color::from_rgb(10, 132, 255);       
+const ACCENT_HOVER: Color = Color::from_rgb(64, 156, 255);        
+const DESTRUCTIVE_COLOR: Color = Color::from_rgb(255, 69, 58);    
+const DESTRUCTIVE_HOVER: Color = Color::from_rgb(255, 105, 97);   
 
 fn style_widget<W: WidgetExt>(w: &mut W) {
     w.set_color(WIDGET_BG);
     w.set_label_color(TEXT_COLOR);
-    w.set_frame(FrameType::FlatBox);
+    w.set_frame(FrameType::RFlatBox); 
+    w.set_selection_color(WIDGET_HOVER);
+    w.clear_visible_focus(); 
 }
 
 fn style_choice(w: &mut Choice) {
     w.set_color(WIDGET_BG);
     w.set_text_color(TEXT_COLOR);
-    w.set_frame(FrameType::FlatBox);
-    w.set_selection_color(Color::from_rgb(80, 80, 80)); 
+    w.set_frame(FrameType::RFlatBox);
+    w.set_selection_color(WIDGET_HOVER);
+    w.clear_visible_focus();
 }
 
 fn load_tray_icon(filename: &str) -> Icon {
@@ -557,11 +651,18 @@ fn extract_clean_name(full_name: &str) -> String {
 fn refresh_knobs_ui(scroll_pack: &mut Pack, dials: &Vec<DialConfig>, active_processes: &[String], capture_devices: &[String]) {
     scroll_pack.clear(); 
     scroll_pack.begin();
+    
+    let scroll_w = scroll_pack.w();
+
     for (i, dial) in dials.iter().enumerate() {
-        let mut row = Flex::default().row().with_size(0, 35);
+
+        let mut row = Flex::default().with_size(scroll_w, 40).row(); 
         row.set_pad(10);
+        row.set_frame(FrameType::NoBox); 
+        
         let mut lbl = Frame::default().with_label(&format!("{}:", i + 1));
         lbl.set_label_color(TEXT_COLOR);
+        lbl.set_label_font(Font::HelveticaBold); 
         
         let mut choice_type = Choice::default();
         style_choice(&mut choice_type);
@@ -578,36 +679,41 @@ fn refresh_knobs_ui(scroll_pack: &mut Pack, dials: &Vec<DialConfig>, active_proc
         let mut choice_proc = Choice::default();
         style_choice(&mut choice_proc);
 
-
         let mut available_choices = match dial.dial_type.as_str() {
             "process" => active_processes.to_vec(),
             "microphone" => capture_devices.to_vec(),
             _ => Vec::new(),
         };
 
-
         if let Some(pname) = &dial.process_name {
-            if !pname.is_empty() && pname != "None" && !available_choices.contains(pname) {
-                available_choices.push(pname.clone());
+            let mut clean_pname = pname.clone();
+            if clean_pname.to_lowercase().ends_with(".exe") {
+                clean_pname.truncate(clean_pname.len() - 4);
+            }
+            if !clean_pname.is_empty() && clean_pname != "None" && !available_choices.contains(&clean_pname) {
+                available_choices.push(clean_pname.clone());
             }
         }
         available_choices.sort();
         available_choices.insert(0, "None".to_string());
 
-
         for p in &available_choices { choice_proc.add_choice(p); }
 
         if dial.dial_type == "process" || dial.dial_type == "microphone" {
             choice_proc.activate();
-            let target = dial.process_name.as_deref().unwrap_or("None");
-            if let Some(idx) = available_choices.iter().position(|x| x == target) {
+            let mut target = dial.process_name.clone().unwrap_or_else(|| "None".to_string());
+            if target.to_lowercase().ends_with(".exe") {
+                target.truncate(target.len() - 4);
+            }
+            
+            if let Some(idx) = available_choices.iter().position(|x| x.to_lowercase() == target.to_lowercase()) {
                 choice_proc.set_value(idx as i32);
             } else {
                 choice_proc.set_value(0); 
             }
         } else {
             choice_proc.deactivate();
-            choice_proc.set_color(BG_COLOR);
+            choice_proc.set_color(Color::from_rgb(20, 20, 22)); 
             choice_proc.set_value(0); 
         }
 
@@ -632,18 +738,31 @@ fn refresh_knobs_ui(scroll_pack: &mut Pack, dials: &Vec<DialConfig>, active_proc
                 if cp_clone.value() < 0 { cp_clone.set_value(0); }
             } else {
                 cp_clone.deactivate();
-                cp_clone.set_color(BG_COLOR);
+                cp_clone.set_color(Color::from_rgb(20, 20, 22));
                 cp_clone.set_value(0);
             }
         });
 
         let mut check_inv = CheckButton::default().with_label("Inv");
+        check_inv.set_color(WIDGET_BG); 
         check_inv.set_label_color(TEXT_COLOR);
         check_inv.set_value(dial.inverted);
+        check_inv.clear_visible_focus();
 
         let mut btn_del = Button::default().with_label("X");
         style_widget(&mut btn_del);
-        btn_del.set_label_color(Color::from_rgb(255, 100, 100));
+        btn_del.set_color(DESTRUCTIVE_COLOR);
+        btn_del.set_selection_color(DESTRUCTIVE_HOVER);
+        btn_del.set_label_color(Color::White);
+        btn_del.set_label_font(Font::HelveticaBold);
+        
+        row.end();
+        
+
+        row.fixed(&lbl, 25);
+        row.fixed(&check_inv, 45);
+        row.fixed(&btn_del, 35);
+        
         let mut sp = scroll_pack.clone();
         let r = row.clone(); 
         btn_del.set_callback(move |_| {
@@ -651,13 +770,12 @@ fn refresh_knobs_ui(scroll_pack: &mut Pack, dials: &Vec<DialConfig>, active_proc
             sp.redraw();
             if let Some(mut p) = sp.parent() { p.redraw(); }
         });
-        
-        row.end();
-        let _ = row.fixed(&lbl, 30);
-        let _ = row.fixed(&check_inv, 50);
-        let _ = row.fixed(&btn_del, 30);
     }
     scroll_pack.end();
+
+    let total_height = dials.len() as i32 * 50; 
+    scroll_pack.set_size(scroll_w, total_height);
+
     scroll_pack.redraw();
     if let Some(mut parent) = scroll_pack.parent() { parent.redraw(); }
 }
@@ -675,13 +793,28 @@ fn populate_choice(choice: &mut Choice, items: &[String], selected_clean: &str, 
     } else if allow_none { choice.set_value(0); }
 }
 
-fn build_gui_and_run(config_path: PathBuf) -> Result<()> {
+unsafe fn apply_main_window_theme(hwnd: *mut c_void) {
+    let preference: u32 = DWMWCP_ROUND;
+    DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &preference as *const u32 as *const c_void, 4);
+    
+    let dark_mode: u32 = 1;
+    DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE_WIN11, &dark_mode as *const u32 as *const c_void, 4);
+    DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE_WIN10, &dark_mode as *const u32 as *const c_void, 4);
+}
+
+
+fn build_gui_and_run(config_path: PathBuf, osd_rx: app::Receiver<(String, f32)>) -> Result<()> {
     let app = app::App::default();
-    let (bg_r, bg_g, bg_b) = BG_COLOR.to_rgb();
-    app::set_background_color(bg_r, bg_g, bg_b);
-    let (fg_r, fg_g, fg_b) = TEXT_COLOR.to_rgb();
-    app::set_foreground_color(fg_r, fg_g, fg_b);
-    app::set_font_size(14);
+    
+    app::set_scheme(app::Scheme::Base);
+    app::set_visible_focus(false); 
+    
+    app::background(0, 0, 0);                 
+    app::background2(28, 28, 30);             
+    app::foreground(255, 255, 255);           
+    
+    app::set_font(Font::Helvetica);
+    app::set_font_size(14); 
 
     let taskbar_icon = load_win_icon("rvci.ico");
     let open_item = MenuItem::new("Open Settings", true, None);
@@ -699,102 +832,232 @@ fn build_gui_and_run(config_path: PathBuf) -> Result<()> {
         .with_icon(load_tray_icon("rvci.ico"))
         .build()?;
 
-    let mut win = Window::default().with_size(440, 720).with_label("RVCI Configuration");
+    let mut win = Window::default().with_size(600, 900).with_label("RVCI");
     win.make_resizable(true);
+    
+
+    win.size_range(440, 600, 0, 0); 
+    
     if let Some(ref ico) = taskbar_icon { win.set_icon(Some(ico.clone())); }
-    win.set_color(BG_COLOR);
+    win.set_frame(FrameType::FlatBox);
+    win.set_color(Color::Black); 
     
     let mut col = Flex::default_fill().column();
-    col.set_margin(15);
-    col.set_pad(10);
+    col.set_frame(FrameType::FlatBox);
+    col.set_color(Color::Black); 
+    col.set_margin(30); 
+    col.set_pad(20);    
 
-    let mut title = Frame::default().with_label("RVCI Configuration");
-    title.set_label_size(24);
+    let mut title = Frame::default().with_label("RVCI Config"); 
+    title.set_label_size(28); 
+    title.set_label_color(TEXT_COLOR);
+    title.set_label_font(Font::HelveticaBold);
+    title.set_align(fltk::enums::Align::Left | fltk::enums::Align::Inside);
 
     let mut row_serial = Flex::default().row();
-    let lbl_port = Frame::default().with_label("Serial:");
+    row_serial.set_frame(FrameType::NoBox); 
+    row_serial.set_pad(10);
+    
+    let mut lbl_port = Frame::default().with_label("Serial Port:");
+    lbl_port.set_label_color(TEXT_COLOR);
+    lbl_port.set_align(fltk::enums::Align::Left | fltk::enums::Align::Inside);
+    
     let mut choice_port = Choice::default();
     style_choice(&mut choice_port);
     let mut choice_baud = Choice::default();
     style_choice(&mut choice_baud);
     for baud in [9600, 19200, 38400, 57600, 115200] { choice_baud.add_choice(&baud.to_string()); }
+    
     let mut btn_scan = Button::default().with_label("Scan");
     style_widget(&mut btn_scan);
+    btn_scan.set_label_font(Font::HelveticaBold);
+    btn_scan.set_color(ACCENT_COLOR);
+    btn_scan.set_selection_color(ACCENT_HOVER);
+    
     row_serial.end();
-    let _ = row_serial.fixed(&lbl_port, 60);
-    let _ = row_serial.fixed(&choice_baud, 90);
-    let _ = row_serial.fixed(&btn_scan, 60);
+    let _ = row_serial.fixed(&lbl_port, 90);
+    let _ = row_serial.fixed(&choice_baud, 95);
+    let _ = row_serial.fixed(&btn_scan, 80);
 
-    let mut lbl_switcher = Frame::default().with_label("Audio Switcher");
-    lbl_switcher.set_label_size(16);
+    let mut row_curve = Flex::default().row();
+    row_curve.set_frame(FrameType::NoBox);
+    row_curve.set_pad(10);
+    let mut lbl_curve = Frame::default().with_label("Volume Curve:");
+    lbl_curve.set_label_color(TEXT_COLOR);
+    lbl_curve.set_align(fltk::enums::Align::Left | fltk::enums::Align::Inside);
+    let mut choice_curve = Choice::default();
+    style_choice(&mut choice_curve);
+    choice_curve.add_choice("Linear (Default)|Logarithmic");
+    row_curve.end();
+    let _ = row_curve.fixed(&lbl_curve, 110);
+
+    let mut lbl_switcher = Frame::default().with_label("Audio Routing");
+    lbl_switcher.set_label_color(TEXT_COLOR);
+    lbl_switcher.set_label_size(18);
+    lbl_switcher.set_label_font(Font::HelveticaBold);
+    lbl_switcher.set_align(fltk::enums::Align::Left | fltk::enums::Align::Inside);
 
     let mut row_wd1 = Flex::default().row();
-    let lbl_wd1 = Frame::default().with_label("Output 1:");
+    row_wd1.set_frame(FrameType::NoBox);
+    row_wd1.set_pad(10);
+    let mut lbl_wd1 = Frame::default().with_label("Output 1:");
+    lbl_wd1.set_label_color(TEXT_COLOR);
+    lbl_wd1.set_align(fltk::enums::Align::Left | fltk::enums::Align::Inside);
     let mut choice_wd1 = Choice::default();
     style_choice(&mut choice_wd1);
     let mut btn_test1 = Button::default().with_label("Test");
     style_widget(&mut btn_test1);
     row_wd1.end();
-    let _ = row_wd1.fixed(&lbl_wd1, 70);
-    let _ = row_wd1.fixed(&btn_test1, 50);
+    let _ = row_wd1.fixed(&lbl_wd1, 80);
+    let _ = row_wd1.fixed(&btn_test1, 70);
 
     let mut row_wd2 = Flex::default().row();
-    let lbl_wd2 = Frame::default().with_label("Output 2:");
+    row_wd2.set_frame(FrameType::NoBox);
+    row_wd2.set_pad(10);
+    let mut lbl_wd2 = Frame::default().with_label("Output 2:");
+    lbl_wd2.set_label_color(TEXT_COLOR);
+    lbl_wd2.set_align(fltk::enums::Align::Left | fltk::enums::Align::Inside);
     let mut choice_wd2 = Choice::default();
     style_choice(&mut choice_wd2);
     let mut btn_test2 = Button::default().with_label("Test");
     style_widget(&mut btn_test2);
     row_wd2.end();
-    let _ = row_wd2.fixed(&lbl_wd2, 70);
-    let _ = row_wd2.fixed(&btn_test2, 50);
+    let _ = row_wd2.fixed(&lbl_wd2, 80);
+    let _ = row_wd2.fixed(&btn_test2, 70);
 
     let mut row_knobs_header = Flex::default().row();
-    let mut lbl_knobs = Frame::default().with_label("Knob Mappings");
-    lbl_knobs.set_label_size(16);
-    let mut btn_add = Button::default().with_label("+ Add");
+    row_knobs_header.set_frame(FrameType::NoBox);
+    row_knobs_header.set_pad(10);
+    let mut lbl_knobs = Frame::default().with_label("Hardware Knobs");
+    lbl_knobs.set_label_color(TEXT_COLOR);
+    lbl_knobs.set_label_size(18);
+    lbl_knobs.set_label_font(Font::HelveticaBold);
+    lbl_knobs.set_align(fltk::enums::Align::Left | fltk::enums::Align::Inside);
+    let mut btn_add = Button::default().with_label("+ Add Knob");
     style_widget(&mut btn_add);
+    btn_add.set_label_font(Font::HelveticaBold);
+    btn_add.set_color(ACCENT_COLOR);
+    btn_add.set_selection_color(ACCENT_HOVER);
     row_knobs_header.end();
-    let _ = row_knobs_header.fixed(&btn_add, 60);
+    let _ = row_knobs_header.fixed(&btn_add, 110);
 
     let mut scroll = Scroll::default();
-    scroll.set_color(BG_COLOR);
-    let mut scroll_pack = Pack::default().with_size(400, 0); 
-    scroll_pack.set_spacing(5);
+    scroll.set_type(fltk::group::ScrollType::VerticalAlways); 
+    scroll.set_scrollbar_size(12); 
+    scroll.set_frame(FrameType::FlatBox);
+    scroll.set_color(Color::Black); 
+
+    let mut scroll_pack = Pack::default().with_size(460, 0); 
+    scroll_pack.set_type(fltk::group::PackType::Vertical);
+    scroll_pack.set_spacing(10);
+    scroll_pack.set_frame(FrameType::NoBox); 
+    
+
+    scroll_pack.handle(|sp, ev| {
+        if ev == fltk::enums::Event::Resize {
+            let w = sp.w();
+            for i in 0..sp.children() {
+                if let Some(mut child) = sp.child(i) {
+                    child.resize(child.x(), child.y(), w, child.h());
+                }
+            }
+        }
+        false
+    });
+
     scroll_pack.end();
     scroll.end();
 
-    let mut row_footer = Flex::default().row(); 
-    let mut check_startup = CheckButton::default().with_label("Launch on Startup");
+    let mut row_footer1 = Flex::default().row(); 
+    row_footer1.set_frame(FrameType::NoBox);
+    let mut check_startup = CheckButton::default().with_label(" Launch at Login");
+    check_startup.set_color(WIDGET_BG); 
     check_startup.set_label_color(TEXT_COLOR);
+    check_startup.clear_visible_focus();
     if check_startup_enabled() { check_startup.set_value(true); }
     
-    let mut check_debug = CheckButton::default().with_label("Debug Mode");
+    let mut check_debug = CheckButton::default().with_label(" Debug Mode");
+    check_debug.set_color(WIDGET_BG);
     check_debug.set_label_color(TEXT_COLOR);
+    check_debug.clear_visible_focus();
 
-    let mut lbl_credits = Frame::default().with_label("Made by TZey");
-    lbl_credits.set_label_size(12);
-    lbl_credits.set_label_color(Color::from_rgb(150, 150, 150));
-    row_footer.end();
-    let _ = row_footer.fixed(&check_startup, 150);
-    let _ = row_footer.fixed(&check_debug, 110);
+    let mut check_osd = CheckButton::default().with_label(" Show OSD");
+    check_osd.set_color(WIDGET_BG);
+    check_osd.set_label_color(TEXT_COLOR);
+    check_osd.clear_visible_focus();
+    row_footer1.end();
+    let _ = row_footer1.fixed(&check_startup, 160);
+    let _ = row_footer1.fixed(&check_debug, 120);
+    let _ = row_footer1.fixed(&check_osd, 110);
 
-    let row_btns = Flex::default().row(); 
-    let mut btn_apply = Button::default().with_label("Apply"); 
-    style_widget(&mut btn_apply);
-    btn_apply.set_color(Color::from_rgb(60, 60, 60)); 
+    let mut row_btns = Flex::default().row(); 
+    row_btns.set_frame(FrameType::NoBox);
+    row_btns.set_pad(15);
+    
     let mut btn_cancel = Button::default().with_label("Close");
     style_widget(&mut btn_cancel);
+    btn_cancel.set_label_font(Font::HelveticaBold);
+    
+    let mut btn_apply = Button::default().with_label("Save Changes"); 
+    style_widget(&mut btn_apply);
+    btn_apply.set_color(ACCENT_COLOR); 
+    btn_apply.set_selection_color(ACCENT_HOVER); 
+    btn_apply.set_label_font(Font::HelveticaBold);
+    
     row_btns.end();
+    let _ = row_btns.fixed(&btn_cancel, 120);
+
+    let mut row_footer2 = Flex::default().row();
+    row_footer2.set_frame(FrameType::NoBox);
+    let mut lbl_author = Frame::default().with_label("Made by TZey");
+    lbl_author.set_label_color(Color::from_rgb(100, 100, 105)); 
+    lbl_author.set_label_size(13);
+    lbl_author.set_label_font(Font::Helvetica);
+    row_footer2.end();
 
     col.end();
-    let _ = col.fixed(&title, 40);
-    let _ = col.fixed(&row_serial, 30);
-    let _ = col.fixed(&lbl_switcher, 25);
-    let _ = col.fixed(&row_wd1, 30);
-    let _ = col.fixed(&row_wd2, 30);
-    let _ = col.fixed(&row_knobs_header, 30);
-    let _ = col.fixed(&row_footer, 25);
-    let _ = col.fixed(&row_btns, 40);
+    let _ = col.fixed(&title, 45);
+    let _ = col.fixed(&row_serial, 40);
+    let _ = col.fixed(&row_curve, 40);
+    let _ = col.fixed(&lbl_switcher, 35);
+    let _ = col.fixed(&row_wd1, 40);
+    let _ = col.fixed(&row_wd2, 40);
+    let _ = col.fixed(&row_knobs_header, 35);
+    let _ = col.fixed(&row_footer1, 35);
+    let _ = col.fixed(&row_btns, 50); 
+    let _ = col.fixed(&row_footer2, 20);
+
+    win.end();
+    win.hide(); 
+
+    let mut osd_bg_win = Window::default().with_size(240, 70);
+    osd_bg_win.set_border(false);
+    osd_bg_win.set_override(); 
+    osd_bg_win.set_frame(FrameType::FlatBox); 
+    osd_bg_win.set_color(Color::Black);       
+    osd_bg_win.end();
+
+    let mut osd_fg_win = Window::default().with_size(240, 70);
+    osd_fg_win.set_border(false);
+    osd_fg_win.set_override(); 
+    osd_fg_win.set_frame(FrameType::FlatBox);
+    osd_fg_win.set_color(Color::Black); 
+
+    let mut osd_lbl = Frame::default().with_size(220, 25).with_pos(10, 10);
+    osd_lbl.set_frame(FrameType::NoBox);
+    osd_lbl.set_label_color(Color::White); 
+    osd_lbl.set_label_font(fltk::enums::Font::HelveticaBold); 
+    osd_lbl.set_label_size(14);
+    osd_lbl.set_align(fltk::enums::Align::Center | fltk::enums::Align::Inside);
+
+    let mut osd_bar = Progress::default().with_size(200, 6).with_pos(20, 46);
+    osd_bar.set_frame(FrameType::RFlatBox); 
+    osd_bar.set_color(Color::from_rgb(60, 60, 65)); 
+    osd_bar.set_selection_color(Color::White);      
+    osd_bar.set_minimum(0.0);
+    osd_bar.set_maximum(1.0);
+    
+    osd_fg_win.end();
 
     let config = if let Ok(file) = File::open(&config_path) {
         serde_json::from_reader(BufReader::new(file)).unwrap_or_default()
@@ -824,13 +1087,14 @@ fn build_gui_and_run(config_path: PathBuf) -> Result<()> {
              choice_baud.set_value(idx as i32);
         }
         check_debug.set_value(cfg.debug_mode);
+        check_osd.set_value(cfg.enable_osd);
+        choice_curve.set_value(if cfg.use_logarithmic_scale { 1 } else { 0 });
 
         let procs = AudioScanner::get_active_sessions();
         let capture_devices: Vec<String> = AudioScanner::get_capture_devices_with_ids().into_iter().map(|d| d.0).collect();
         refresh_knobs_ui(&mut scroll_pack, &cfg.dials, &procs, &capture_devices);
     }
 
-    // Callbacks
     {
         let mut scroll_pack = scroll_pack.clone();
         let state = state.clone();
@@ -854,7 +1118,7 @@ fn build_gui_and_run(config_path: PathBuf) -> Result<()> {
             for i in 0..scroll_pack.children() {
                 if let Some(row) = scroll_pack.child(i) {
                     if let Some(node) = row.as_group() {
-                        if node.children() >= 4 { 
+                        if node.children() >= 5 { 
                             let c_type = unsafe { Choice::from_widget_ptr(node.child(1).unwrap().as_widget_ptr()) };
                             let c_proc = unsafe { Choice::from_widget_ptr(node.child(2).unwrap().as_widget_ptr()) };
                             let c_inv = unsafe { CheckButton::from_widget_ptr(node.child(3).unwrap().as_widget_ptr()) };
@@ -894,10 +1158,12 @@ fn build_gui_and_run(config_path: PathBuf) -> Result<()> {
         let scroll_pack = scroll_pack.clone();
         let choice_port = choice_port.clone();
         let choice_baud = choice_baud.clone();
+        let choice_curve = choice_curve.clone();
         let choice_wd1 = choice_wd1.clone();
         let choice_wd2 = choice_wd2.clone();
         let check_startup = check_startup.clone();
         let check_debug = check_debug.clone();
+        let check_osd = check_osd.clone();
         let path = config_path.clone();
         
         btn_apply.set_callback(move |_| {
@@ -911,12 +1177,14 @@ fn build_gui_and_run(config_path: PathBuf) -> Result<()> {
             if let Some(s) = choice_wd2.choice() { cfg.work_device_2 = extract_clean_name(&s); }
             
             cfg.debug_mode = check_debug.value();
+            cfg.enable_osd = check_osd.value();
+            cfg.use_logarithmic_scale = choice_curve.value() == 1;
 
             let mut new_dials = Vec::new();
             for i in 0..scroll_pack.children() {
                 if let Some(row) = scroll_pack.child(i) {
                     if let Some(node) = row.as_group() {
-                        if node.children() >= 4 { 
+                        if node.children() >= 5 { 
                             let c_type = unsafe { Choice::from_widget_ptr(node.child(1).unwrap().as_widget_ptr()) };
                             let c_proc = unsafe { Choice::from_widget_ptr(node.child(2).unwrap().as_widget_ptr()) };
                             let c_inv = unsafe { CheckButton::from_widget_ptr(node.child(3).unwrap().as_widget_ptr()) };
@@ -953,9 +1221,12 @@ fn build_gui_and_run(config_path: PathBuf) -> Result<()> {
         btn_cancel.set_callback(move |_| win.hide());
     }
 
-    win.hide();
+    let mut last_osd_update = Instant::now();
+    let mut osd_is_visible = false;
+
     loop {
         app::check();
+
         if let Ok(event) = MenuEvent::receiver().try_recv() {
             if event.id == open_id {
                 refresh_all_data();
@@ -963,9 +1234,15 @@ fn build_gui_and_run(config_path: PathBuf) -> Result<()> {
                 let procs = AudioScanner::get_active_sessions();
                 let capture_devices: Vec<String> = AudioScanner::get_capture_devices_with_ids().into_iter().map(|d| d.0).collect();
                 refresh_knobs_ui(&mut scroll_pack, &cfg.dials, &procs, &capture_devices);
+                
                 win.show();
+                app::flush(); 
+                win.redraw();
+
+                unsafe { apply_main_window_theme(win.raw_handle()); }
             } else if event.id == quit_id { app.quit(); break; }
         }
+        
         if let Ok(event) = TrayIconEvent::receiver().try_recv() {
              if let TrayIconEvent::Click { button: MouseButton::Left, .. } = event {
                 refresh_all_data();
@@ -973,9 +1250,101 @@ fn build_gui_and_run(config_path: PathBuf) -> Result<()> {
                 let procs = AudioScanner::get_active_sessions();
                 let capture_devices: Vec<String> = AudioScanner::get_capture_devices_with_ids().into_iter().map(|d| d.0).collect();
                 refresh_knobs_ui(&mut scroll_pack, &cfg.dials, &procs, &capture_devices);
+                
                 win.show();
+                app::flush(); 
+                win.redraw();
+
+                unsafe { apply_main_window_theme(win.raw_handle()); }
              }
         }
+
+        let mut got_msg = false;
+        let mut final_app = String::new();
+        let mut final_vol = 0.0;
+
+        while let Some((app_name, vol_level)) = osd_rx.recv() {
+            got_msg = true;
+            final_app = app_name;
+            final_vol = vol_level;
+        }
+
+        if got_msg {
+            osd_lbl.set_label(&final_app);
+            osd_bar.set_value(final_vol as f64);
+            
+            if !osd_is_visible {
+                
+                let mut primary_screen_idx = 0;
+                for i in 0..app::screen_count() {
+                    let (x, y, _w, _h) = app::screen_xywh(i);
+                    if x == 0 && y == 0 {
+                        primary_screen_idx = i;
+                        break;
+                    }
+                }
+
+                let (screen_x, screen_y, screen_w, screen_h) = app::screen_xywh(primary_screen_idx);
+                
+                let scale = ((screen_h as f32 / 1080.0) * 0.7).max(0.5); 
+
+                let osd_w = (240.0 * scale) as i32;
+                let osd_h = (70.0 * scale) as i32;
+
+                let desired_x = screen_x + (screen_w / 2) - (osd_w / 2);
+                let desired_y = screen_y + screen_h - osd_h - (120.0 * scale) as i32;
+                let pos_x = desired_x.clamp(screen_x, screen_x + screen_w - osd_w);
+                let pos_y = desired_y.clamp(screen_y, screen_y + screen_h - osd_h);
+
+                osd_bg_win.resize(pos_x, pos_y, osd_w, osd_h);
+                osd_fg_win.resize(pos_x, pos_y, osd_w, osd_h);
+
+                osd_lbl.resize((10.0 * scale) as i32, (10.0 * scale) as i32, (220.0 * scale) as i32, (25.0 * scale) as i32);
+                osd_lbl.set_label_size((14.0 * scale) as i32);
+                osd_bar.resize((20.0 * scale) as i32, (46.0 * scale) as i32, (200.0 * scale) as i32, (6.0 * scale) as i32);
+
+                osd_bg_win.show();
+                osd_fg_win.show();
+
+                unsafe {
+                    let preference: u32 = DWMWCP_ROUND;
+
+                    let bg_hwnd = osd_bg_win.raw_handle();
+                    DwmSetWindowAttribute(bg_hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &preference as *const u32 as *const c_void, 4);
+
+                    let mut ex_style = get_win_long(bg_hwnd, GWL_EXSTYLE);
+                    ex_style |= WS_EX_LAYERED | WS_EX_TRANSPARENT; 
+                    set_win_long(bg_hwnd, GWL_EXSTYLE, ex_style);
+                    
+                    SetLayeredWindowAttributes(bg_hwnd as _, 0, 180, LWA_ALPHA); 
+                    SetWindowPos(bg_hwnd, HWND_TOPMOST as *mut c_void, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+
+                    let fg_hwnd = osd_fg_win.raw_handle();
+                    DwmSetWindowAttribute(fg_hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &preference as *const u32 as *const c_void, 4);
+
+                    let mut ex_style_fg = get_win_long(fg_hwnd, GWL_EXSTYLE);
+                    ex_style_fg |= WS_EX_LAYERED | WS_EX_TRANSPARENT; 
+                    set_win_long(fg_hwnd, GWL_EXSTYLE, ex_style_fg);
+
+                    SetLayeredWindowAttributes(fg_hwnd as _, 0x00000000, 0, LWA_COLORKEY);
+
+                    SetWindowPos(fg_hwnd, HWND_TOPMOST as *mut c_void, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+                }
+                
+                osd_is_visible = true;
+            }
+            
+            osd_bg_win.redraw();
+            osd_fg_win.redraw();
+            last_osd_update = Instant::now();
+        }
+
+        if osd_is_visible && last_osd_update.elapsed() > Duration::from_millis(1500) {
+            osd_bg_win.hide();
+            osd_fg_win.hide();
+            osd_is_visible = false;
+        }
+
         std::thread::sleep(Duration::from_millis(16));
     }
     Ok(())
@@ -984,7 +1353,6 @@ fn build_gui_and_run(config_path: PathBuf) -> Result<()> {
 fn main() -> Result<()> {
     let path = get_config_path();
 
-    // debug mode
     let debug_mode_enabled = if let Ok(file) = File::open(&path) {
         let config: AppConfig = serde_json::from_reader(BufReader::new(file)).unwrap_or_default();
         config.debug_mode
@@ -994,7 +1362,6 @@ fn main() -> Result<()> {
 
     if debug_mode_enabled {
         unsafe {
-            
             let _ = AllocConsole();
         }
         println!("==========================================");
@@ -1005,6 +1372,8 @@ fn main() -> Result<()> {
     }
 
     let path_clone = path.clone();
-    std::thread::spawn(move || { run_volume_logic_loop(path_clone); });
-    build_gui_and_run(path)
+    let (osd_tx, osd_rx) = app::channel::<(String, f32)>();
+
+    std::thread::spawn(move || { run_volume_logic_loop(path_clone, osd_tx); });
+    build_gui_and_run(path, osd_rx)
 }
