@@ -20,6 +20,7 @@ use fltk::{
     group::{Flex, Pack, Scroll},
     menu::Choice,
     misc::Progress,
+    input::{Input, IntInput}, 
     prelude::*,
     window::Window,
     image::RgbImage, 
@@ -48,6 +49,10 @@ use windows::Win32::System::Threading::{
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::System::Console::AllocConsole;
+
+// ==========================================
+// DIRECT WINDOWS API HOOKS
+// ==========================================
 
 #[link(name = "dwmapi")]
 extern "system" {
@@ -149,7 +154,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             serial: SerialConfig { port: "COM3".to_string(), baud: 115200, timeout: 50 },
-            value_max: 1024.0,
+            value_max: 720.0,
             work_device_1: "None".to_string(),
             work_device_2: "None".to_string(),
             debug_mode: false,
@@ -592,14 +597,17 @@ fn run_serial_processing(config: &AppConfig, config_path: &PathBuf, smoothers: &
     }
 }
 
+// ==========================================
+// MODERN iOS-STYLE GUI RENDERING & THEME
+// ==========================================
 
-const WIDGET_BG: Color = Color::from_rgb(28, 28, 30);             
-const WIDGET_HOVER: Color = Color::from_rgb(44, 44, 46);         
-const TEXT_COLOR: Color = Color::from_rgb(255, 255, 255);        
-const ACCENT_COLOR: Color = Color::from_rgb(10, 132, 255);       
-const ACCENT_HOVER: Color = Color::from_rgb(64, 156, 255);        
-const DESTRUCTIVE_COLOR: Color = Color::from_rgb(255, 69, 58);    
-const DESTRUCTIVE_HOVER: Color = Color::from_rgb(255, 105, 97);   
+const WIDGET_BG: Color = Color::from_rgb(28, 28, 30);             // Secondary Grouped Background
+const WIDGET_HOVER: Color = Color::from_rgb(44, 44, 46);          // Tertiary Hover State
+const TEXT_COLOR: Color = Color::from_rgb(255, 255, 255);         // Pure White
+const ACCENT_COLOR: Color = Color::from_rgb(10, 132, 255);        // iOS Dark Mode Blue
+const ACCENT_HOVER: Color = Color::from_rgb(64, 156, 255);        // Lighter iOS Blue
+const DESTRUCTIVE_COLOR: Color = Color::from_rgb(255, 69, 58);    // iOS Red
+const DESTRUCTIVE_HOVER: Color = Color::from_rgb(255, 105, 97);   // Lighter iOS Red
 
 fn style_widget<W: WidgetExt>(w: &mut W) {
     w.set_color(WIDGET_BG);
@@ -655,7 +663,6 @@ fn refresh_knobs_ui(scroll_pack: &mut Pack, dials: &Vec<DialConfig>, active_proc
     let scroll_w = scroll_pack.w();
 
     for (i, dial) in dials.iter().enumerate() {
-
         let mut row = Flex::default().with_size(scroll_w, 40).row(); 
         row.set_pad(10);
         row.set_frame(FrameType::NoBox); 
@@ -758,7 +765,6 @@ fn refresh_knobs_ui(scroll_pack: &mut Pack, dials: &Vec<DialConfig>, active_proc
         
         row.end();
         
-
         row.fixed(&lbl, 25);
         row.fixed(&check_inv, 45);
         row.fixed(&btn_del, 35);
@@ -832,11 +838,9 @@ fn build_gui_and_run(config_path: PathBuf, osd_rx: app::Receiver<(String, f32)>)
         .with_icon(load_tray_icon("rvci.ico"))
         .build()?;
 
-    let mut win = Window::default().with_size(600, 900).with_label("RVCI");
+    let mut win = Window::default().with_size(600, 970).with_label("RVCI");
     win.make_resizable(true);
-    
-
-    win.size_range(440, 600, 0, 0); 
+    win.size_range(440, 640, 0, 0); 
     
     if let Some(ref ico) = taskbar_icon { win.set_icon(Some(ico.clone())); }
     win.set_frame(FrameType::FlatBox);
@@ -854,10 +858,11 @@ fn build_gui_and_run(config_path: PathBuf, osd_rx: app::Receiver<(String, f32)>)
     title.set_label_font(Font::HelveticaBold);
     title.set_align(fltk::enums::Align::Left | fltk::enums::Align::Inside);
 
+    let label_w = 125; 
+
     let mut row_serial = Flex::default().row();
     row_serial.set_frame(FrameType::NoBox); 
     row_serial.set_pad(10);
-    
     let mut lbl_port = Frame::default().with_label("Serial Port:");
     lbl_port.set_label_color(TEXT_COLOR);
     lbl_port.set_align(fltk::enums::Align::Left | fltk::enums::Align::Inside);
@@ -868,16 +873,55 @@ fn build_gui_and_run(config_path: PathBuf, osd_rx: app::Receiver<(String, f32)>)
     style_choice(&mut choice_baud);
     for baud in [9600, 19200, 38400, 57600, 115200] { choice_baud.add_choice(&baud.to_string()); }
     
-    let mut btn_scan = Button::default().with_label("Scan");
+    let mut btn_scan = Button::default().with_label("Update");
     style_widget(&mut btn_scan);
     btn_scan.set_label_font(Font::HelveticaBold);
     btn_scan.set_color(ACCENT_COLOR);
     btn_scan.set_selection_color(ACCENT_HOVER);
     
     row_serial.end();
-    let _ = row_serial.fixed(&lbl_port, 90);
+    let _ = row_serial.fixed(&lbl_port, label_w);
     let _ = row_serial.fixed(&choice_baud, 95);
     let _ = row_serial.fixed(&btn_scan, 80);
+
+    let mut row_max_val = Flex::default().row();
+    row_max_val.set_frame(FrameType::NoBox);
+    row_max_val.set_pad(10);
+    
+    let mut lbl_max_val = Frame::default().with_label("Max Pot Value:");
+    lbl_max_val.set_label_color(TEXT_COLOR);
+    lbl_max_val.set_align(fltk::enums::Align::Left | fltk::enums::Align::Inside);
+    
+    let mut fake_bubble = Flex::default().row();
+    fake_bubble.set_frame(FrameType::RFlatBox);
+    fake_bubble.set_color(WIDGET_BG);
+
+    fake_bubble.set_margin(2); 
+    
+    let mut spacer_left = Button::default();
+    spacer_left.set_frame(FrameType::NoBox);
+
+    let mut input_max_val = IntInput::default();
+    input_max_val.set_frame(FrameType::FlatBox); 
+    input_max_val.set_color(WIDGET_BG); 
+    input_max_val.set_text_color(TEXT_COLOR);
+    input_max_val.set_cursor_color(Color::White); 
+    input_max_val.set_selection_color(WIDGET_HOVER);
+
+    let mut spacer_right = Button::default();
+    spacer_right.set_frame(FrameType::NoBox);
+    
+    fake_bubble.end();
+    
+    let mut ic1 = input_max_val.clone();
+    spacer_left.set_callback(move |_| { let _ = ic1.take_focus(); });
+    let mut ic2 = input_max_val.clone();
+    spacer_right.set_callback(move |_| { let _ = ic2.take_focus(); });
+    
+    let _ = fake_bubble.fixed(&input_max_val, 50); 
+    
+    row_max_val.end();
+    let _ = row_max_val.fixed(&lbl_max_val, label_w);
 
     let mut row_curve = Flex::default().row();
     row_curve.set_frame(FrameType::NoBox);
@@ -889,7 +933,7 @@ fn build_gui_and_run(config_path: PathBuf, osd_rx: app::Receiver<(String, f32)>)
     style_choice(&mut choice_curve);
     choice_curve.add_choice("Linear (Default)|Logarithmic");
     row_curve.end();
-    let _ = row_curve.fixed(&lbl_curve, 110);
+    let _ = row_curve.fixed(&lbl_curve, label_w);
 
     let mut lbl_switcher = Frame::default().with_label("Audio Routing");
     lbl_switcher.set_label_color(TEXT_COLOR);
@@ -908,7 +952,7 @@ fn build_gui_and_run(config_path: PathBuf, osd_rx: app::Receiver<(String, f32)>)
     let mut btn_test1 = Button::default().with_label("Test");
     style_widget(&mut btn_test1);
     row_wd1.end();
-    let _ = row_wd1.fixed(&lbl_wd1, 80);
+    let _ = row_wd1.fixed(&lbl_wd1, label_w);
     let _ = row_wd1.fixed(&btn_test1, 70);
 
     let mut row_wd2 = Flex::default().row();
@@ -922,13 +966,13 @@ fn build_gui_and_run(config_path: PathBuf, osd_rx: app::Receiver<(String, f32)>)
     let mut btn_test2 = Button::default().with_label("Test");
     style_widget(&mut btn_test2);
     row_wd2.end();
-    let _ = row_wd2.fixed(&lbl_wd2, 80);
+    let _ = row_wd2.fixed(&lbl_wd2, label_w);
     let _ = row_wd2.fixed(&btn_test2, 70);
 
     let mut row_knobs_header = Flex::default().row();
     row_knobs_header.set_frame(FrameType::NoBox);
     row_knobs_header.set_pad(10);
-    let mut lbl_knobs = Frame::default().with_label("Hardware Knobs");
+    let mut lbl_knobs = Frame::default().with_label("Knob Mappings");
     lbl_knobs.set_label_color(TEXT_COLOR);
     lbl_knobs.set_label_size(18);
     lbl_knobs.set_label_font(Font::HelveticaBold);
@@ -952,7 +996,6 @@ fn build_gui_and_run(config_path: PathBuf, osd_rx: app::Receiver<(String, f32)>)
     scroll_pack.set_spacing(10);
     scroll_pack.set_frame(FrameType::NoBox); 
     
-
     scroll_pack.handle(|sp, ev| {
         if ev == fltk::enums::Event::Resize {
             let w = sp.w();
@@ -970,7 +1013,7 @@ fn build_gui_and_run(config_path: PathBuf, osd_rx: app::Receiver<(String, f32)>)
 
     let mut row_footer1 = Flex::default().row(); 
     row_footer1.set_frame(FrameType::NoBox);
-    let mut check_startup = CheckButton::default().with_label(" Launch at Login");
+    let mut check_startup = CheckButton::default().with_label(" Launch at Startup");
     check_startup.set_color(WIDGET_BG); 
     check_startup.set_label_color(TEXT_COLOR);
     check_startup.clear_visible_focus();
@@ -981,7 +1024,7 @@ fn build_gui_and_run(config_path: PathBuf, osd_rx: app::Receiver<(String, f32)>)
     check_debug.set_label_color(TEXT_COLOR);
     check_debug.clear_visible_focus();
 
-    let mut check_osd = CheckButton::default().with_label(" Show OSD");
+    let mut check_osd = CheckButton::default().with_label("Show OSD");
     check_osd.set_color(WIDGET_BG);
     check_osd.set_label_color(TEXT_COLOR);
     check_osd.clear_visible_focus();
@@ -1018,6 +1061,7 @@ fn build_gui_and_run(config_path: PathBuf, osd_rx: app::Receiver<(String, f32)>)
     col.end();
     let _ = col.fixed(&title, 45);
     let _ = col.fixed(&row_serial, 40);
+    let _ = col.fixed(&row_max_val, 40); 
     let _ = col.fixed(&row_curve, 40);
     let _ = col.fixed(&lbl_switcher, 35);
     let _ = col.fixed(&row_wd1, 40);
@@ -1029,7 +1073,7 @@ fn build_gui_and_run(config_path: PathBuf, osd_rx: app::Receiver<(String, f32)>)
 
     win.end();
     win.hide(); 
-
+    
     let mut osd_bg_win = Window::default().with_size(240, 70);
     osd_bg_win.set_border(false);
     osd_bg_win.set_override(); 
@@ -1086,6 +1130,9 @@ fn build_gui_and_run(config_path: PathBuf, osd_rx: app::Receiver<(String, f32)>)
         if let Some(idx) = [9600, 19200, 38400, 57600, 115200].iter().position(|&x| x == cfg.serial.baud) {
              choice_baud.set_value(idx as i32);
         }
+        
+        input_max_val.set_value(&(cfg.value_max as i32).to_string());
+        
         check_debug.set_value(cfg.debug_mode);
         check_osd.set_value(cfg.enable_osd);
         choice_curve.set_value(if cfg.use_logarithmic_scale { 1 } else { 0 });
@@ -1164,6 +1211,7 @@ fn build_gui_and_run(config_path: PathBuf, osd_rx: app::Receiver<(String, f32)>)
         let check_startup = check_startup.clone();
         let check_debug = check_debug.clone();
         let check_osd = check_osd.clone();
+        let input_max_val = input_max_val.clone();
         let path = config_path.clone();
         
         btn_apply.set_callback(move |_| {
@@ -1175,6 +1223,10 @@ fn build_gui_and_run(config_path: PathBuf, osd_rx: app::Receiver<(String, f32)>)
             }
             if let Some(s) = choice_wd1.choice() { cfg.work_device_1 = extract_clean_name(&s); }
             if let Some(s) = choice_wd2.choice() { cfg.work_device_2 = extract_clean_name(&s); }
+            
+            if let Ok(v) = input_max_val.value().trim().parse::<f32>() {
+                cfg.value_max = v;
+            }
             
             cfg.debug_mode = check_debug.value();
             cfg.enable_osd = check_osd.value();
@@ -1309,6 +1361,7 @@ fn build_gui_and_run(config_path: PathBuf, osd_rx: app::Receiver<(String, f32)>)
                 unsafe {
                     let preference: u32 = DWMWCP_ROUND;
 
+                    // --- LAYER 1: The Tinted Box ---
                     let bg_hwnd = osd_bg_win.raw_handle();
                     DwmSetWindowAttribute(bg_hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &preference as *const u32 as *const c_void, 4);
 
@@ -1319,6 +1372,7 @@ fn build_gui_and_run(config_path: PathBuf, osd_rx: app::Receiver<(String, f32)>)
                     SetLayeredWindowAttributes(bg_hwnd as _, 0, 180, LWA_ALPHA); 
                     SetWindowPos(bg_hwnd, HWND_TOPMOST as *mut c_void, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
 
+                    // --- LAYER 2: The Text ---
                     let fg_hwnd = osd_fg_win.raw_handle();
                     DwmSetWindowAttribute(fg_hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &preference as *const u32 as *const c_void, 4);
 

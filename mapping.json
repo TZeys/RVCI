@@ -1,7 +1,7 @@
 {
   "serial": {
     "port": "COM11",
-    "baud": 9600,
+    "baud": 115200,
     "timeout": 1
   },
   "value_max": 1024.0,
