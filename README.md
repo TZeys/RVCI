@@ -22,7 +22,7 @@ Furthermore, you can choose between a linear volume curve, or a logarithmic MacO
 in the GUI as well. If you like a more old-school deej-style config, you can find mapping.json in AppData\Roaming\RVCI.
 
 <img width="262" height="428" alt="image" src="https://github.com/user-attachments/assets/5ccc2398-f27c-45f7-a00d-da886ec10851" />
-<img width="257" height="46" alt="image" src="https://github.com/user-attachments/assets/ea747f7d-797f-4446-bf67-ec439207486a" />
+<img width="514" height="92" alt="image" src="https://github.com/user-attachments/assets/ea747f7d-797f-4446-bf67-ec439207486a" />
 
 
 ## Hardware:
