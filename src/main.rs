@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 use std::collections::HashMap;
 use std::ffi::c_void;
 
-//fltk imports
 use fltk::{
     app,
     button::{Button, CheckButton},
@@ -26,17 +25,14 @@ use fltk::{
     image::RgbImage, 
 };
 
-//winreg bs
 use winreg::enums::*;
 use winreg::RegKey;
 
-//tray icons
 use tray_icon::{
     menu::{Menu, MenuItem, MenuEvent},
     TrayIconBuilder, Icon, TrayIconEvent, MouseButton,
 };
 
-//WAPI imports
 use windows::core::{Interface, interface, GUID, PCWSTR, PCSTR, IUnknown, IUnknown_Vtbl}; 
 use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
@@ -49,10 +45,6 @@ use windows::Win32::System::Threading::{
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::System::Console::AllocConsole;
-
-// ==========================================
-// DIRECT WINDOWS API HOOKS
-// ==========================================
 
 #[link(name = "dwmapi")]
 extern "system" {
@@ -73,6 +65,7 @@ const DWMWCP_ROUND: u32 = 2;
 extern "system" {
     fn SetWindowPos(hWnd: *mut c_void, hWndInsertAfter: *mut c_void, X: i32, Y: i32, cx: i32, cy: i32, uFlags: u32) -> i32;
     fn SetLayeredWindowAttributes(hwnd: *mut c_void, crKey: u32, bAlpha: u8, dwFlags: u32) -> i32;
+    fn ShowWindow(hWnd: *mut c_void, nCmdShow: i32) -> i32;
 
     #[cfg(target_arch = "x86_64")]
     fn GetWindowLongPtrW(hWnd: *mut c_void, nIndex: i32) -> isize;
@@ -98,11 +91,15 @@ unsafe fn set_win_long(hwnd: *mut c_void, idx: i32, val: i32) -> isize { SetWind
 const HWND_TOPMOST: isize = -1;
 const SWP_NOSIZE: u32 = 0x0001;
 const SWP_NOMOVE: u32 = 0x0002;
+const SWP_NOACTIVATE: u32 = 0x0010; 
 const GWL_EXSTYLE: i32 = -20;
 const WS_EX_LAYERED: isize = 0x00080000;
 const WS_EX_TRANSPARENT: isize = 0x00000020;
+const WS_EX_NOACTIVATE: isize = 0x08000000; 
 const LWA_COLORKEY: u32 = 0x00000001;
 const LWA_ALPHA: u32 = 0x00000002;
+const SW_HIDE: i32 = 0;
+const SW_SHOWNA: i32 = 8; 
 
 const CLSID_PolicyConfigClient: GUID = GUID::from_u128(0x870af99c_171d_4f9e_af0d_e63df40c2bc9);
 
@@ -352,14 +349,11 @@ impl Smoother {
 
 fn switch_device(clean_name: &str) {
     if clean_name == "None" || clean_name.is_empty() { return; }
-    println!("DEBUG: Attempting to switch output device to -> '{}'", clean_name);
-
     let all_devices = AudioScanner::get_playback_devices_with_ids();
     let match_result = all_devices.iter()
         .find(|(name, _id)| name.to_lowercase().contains(&clean_name.to_lowercase()));
 
-    if let Some((found_name, real_id)) = match_result {
-        println!("DEBUG: Found matching device: '{}' (ID: {})", found_name, real_id);
+    if let Some((_, real_id)) = match_result {
         unsafe {
             if let Ok(policy) = CoCreateInstance::<_, IPolicyConfig>(&CLSID_PolicyConfigClient, None, CLSCTX_ALL) {
                 let mut id_utf16: Vec<u16> = real_id.encode_utf16().collect();
@@ -369,13 +363,8 @@ fn switch_device(clean_name: &str) {
                 let _ = policy.SetDefaultEndpoint(pcwstr_id, eConsole);
                 let _ = policy.SetDefaultEndpoint(pcwstr_id, eMultimedia);
                 let _ = policy.SetDefaultEndpoint(pcwstr_id, eCommunications);
-                println!("DEBUG: Successfully switched to '{}'", found_name);
-            } else {
-                println!("ERROR: Failed to instantiate IPolicyConfig COM object.");
             }
         }
-    } else {
-        println!("ERROR: Could not find playback device matching '{}'", clean_name);
     }
 }
 
@@ -392,11 +381,9 @@ fn run_volume_logic_loop(config_path: PathBuf, osd_tx: app::Sender<(String, f32)
             let new_sig = format!("{}{}", config.serial.port, config.serial.baud);
             if new_sig != current_config_sig {
                 current_config_sig = new_sig;
-                println!("DEBUG: Serial configuration updated. Target: {} @ {}", config.serial.port, config.serial.baud);
                 smoothers = (0..config.dials.len()).map(|_| Smoother::new()).collect();
             }
-             if let Err(e) = run_serial_processing(&config, &config_path, &mut smoothers, &osd_tx) {
-                println!("DEBUG: Serial Connection Error: {}. Retrying in 2 seconds...", e);
+             if let Err(_) = run_serial_processing(&config, &config_path, &mut smoothers, &osd_tx) {
                 std::thread::sleep(Duration::from_secs(2));
              }
         } else {
@@ -411,13 +398,12 @@ fn run_serial_processing(config: &AppConfig, config_path: &PathBuf, smoothers: &
         .open()
         .context("Failed to open serial port")?;
     
-    println!("DEBUG: Connected to serial port successfully.");
-    
     let mut reader = BufReader::new(port);
     let mut line_buf = String::new();
     let mut last_update = Instant::now();
     
     let mut last_applied_values: Vec<f32> = vec![-1.0; config.dials.len()];
+    let mut last_osd_raw_values: Vec<f32> = vec![-999.0; config.dials.len()];
 
     let mut pid_name_cache: HashMap<u32, String> = HashMap::new();
     let mut mic_device_cache: HashMap<String, IAudioEndpointVolume> = HashMap::new();
@@ -476,6 +462,14 @@ fn run_serial_processing(config: &AppConfig, config_path: &PathBuf, smoothers: &
                     if let Ok(raw_val) = part.parse::<f32>() {
                         let dial_cfg = &config.dials[i];
                         
+                        if i >= last_osd_raw_values.len() { last_osd_raw_values.push(-999.0); }
+                        
+                        let mut trigger_osd = false;
+                        if (raw_val - last_osd_raw_values[i]).abs() > 15.0 {
+                            trigger_osd = true;
+                            last_osd_raw_values[i] = raw_val;
+                        }
+
                         let mut normalized = raw_val.clamp(0.0, config.value_max) / config.value_max;
                         
                         if dial_cfg.inverted {
@@ -498,9 +492,8 @@ fn run_serial_processing(config: &AppConfig, config_path: &PathBuf, smoothers: &
                         last_applied_values[i] = smoothed;
                         
                         let target_lbl = dial_cfg.process_name.as_deref().unwrap_or("Unassigned");
-                        println!("DEBUG: [Knob {}] {} ({}) -> {:.3}", i + 1, dial_cfg.dial_type, target_lbl, smoothed);
 
-                        if config.enable_osd {
+                        if config.enable_osd && trigger_osd {
                             let display_name = match dial_cfg.dial_type.as_str() {
                                 "system" => "Master Volume".to_string(),
                                 "all_others" => "Other Apps".to_string(),
@@ -589,6 +582,14 @@ fn run_serial_processing(config: &AppConfig, config_path: &PathBuf, smoothers: &
                     }
                 }
             },
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::TimedOut {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                } else {
+                    return Err(anyhow::anyhow!("Serial error"));
+                }
+            },
             _ => {
                 std::thread::sleep(Duration::from_millis(10));
                 continue;
@@ -597,17 +598,13 @@ fn run_serial_processing(config: &AppConfig, config_path: &PathBuf, smoothers: &
     }
 }
 
-// ==========================================
-// MODERN iOS-STYLE GUI RENDERING & THEME
-// ==========================================
-
-const WIDGET_BG: Color = Color::from_rgb(28, 28, 30);             // Secondary Grouped Background
-const WIDGET_HOVER: Color = Color::from_rgb(44, 44, 46);          // Tertiary Hover State
-const TEXT_COLOR: Color = Color::from_rgb(255, 255, 255);         // Pure White
-const ACCENT_COLOR: Color = Color::from_rgb(10, 132, 255);        // iOS Dark Mode Blue
-const ACCENT_HOVER: Color = Color::from_rgb(64, 156, 255);        // Lighter iOS Blue
-const DESTRUCTIVE_COLOR: Color = Color::from_rgb(255, 69, 58);    // iOS Red
-const DESTRUCTIVE_HOVER: Color = Color::from_rgb(255, 105, 97);   // Lighter iOS Red
+const WIDGET_BG: Color = Color::from_rgb(28, 28, 30);
+const WIDGET_HOVER: Color = Color::from_rgb(44, 44, 46);
+const TEXT_COLOR: Color = Color::from_rgb(255, 255, 255);
+const ACCENT_COLOR: Color = Color::from_rgb(10, 132, 255);
+const ACCENT_HOVER: Color = Color::from_rgb(64, 156, 255);
+const DESTRUCTIVE_COLOR: Color = Color::from_rgb(255, 69, 58);
+const DESTRUCTIVE_HOVER: Color = Color::from_rgb(255, 105, 97);
 
 fn style_widget<W: WidgetExt>(w: &mut W) {
     w.set_color(WIDGET_BG);
@@ -838,7 +835,7 @@ fn build_gui_and_run(config_path: PathBuf, osd_rx: app::Receiver<(String, f32)>)
         .with_icon(load_tray_icon("rvci.ico"))
         .build()?;
 
-    let mut win = Window::default().with_size(600, 970).with_label("RVCI");
+    let mut win = Window::default().with_size(600, 970).with_label("RVCI Configuration");
     win.make_resizable(true);
     win.size_range(440, 640, 0, 0); 
     
@@ -895,7 +892,6 @@ fn build_gui_and_run(config_path: PathBuf, osd_rx: app::Receiver<(String, f32)>)
     let mut fake_bubble = Flex::default().row();
     fake_bubble.set_frame(FrameType::RFlatBox);
     fake_bubble.set_color(WIDGET_BG);
-
     fake_bubble.set_margin(2); 
     
     let mut spacer_left = Button::default();
@@ -1024,7 +1020,7 @@ fn build_gui_and_run(config_path: PathBuf, osd_rx: app::Receiver<(String, f32)>)
     check_debug.set_label_color(TEXT_COLOR);
     check_debug.clear_visible_focus();
 
-    let mut check_osd = CheckButton::default().with_label("Show OSD");
+    let mut check_osd = CheckButton::default().with_label(" Show OSD");
     check_osd.set_color(WIDGET_BG);
     check_osd.set_label_color(TEXT_COLOR);
     check_osd.clear_visible_focus();
@@ -1102,6 +1098,33 @@ fn build_gui_and_run(config_path: PathBuf, osd_rx: app::Receiver<(String, f32)>)
     osd_bar.set_maximum(1.0);
     
     osd_fg_win.end();
+
+    osd_bg_win.resize(-2000, -2000, 240, 70);
+    osd_fg_win.resize(-2000, -2000, 240, 70);
+    osd_bg_win.show();
+    osd_fg_win.show();
+
+    unsafe {
+        let preference: u32 = DWMWCP_ROUND;
+
+        let bg_hwnd = osd_bg_win.raw_handle();
+        DwmSetWindowAttribute(bg_hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &preference as *const u32 as *const c_void, 4);
+        let mut ex_style = get_win_long(bg_hwnd, GWL_EXSTYLE);
+        ex_style |= WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE;
+        set_win_long(bg_hwnd, GWL_EXSTYLE, ex_style);
+        SetLayeredWindowAttributes(bg_hwnd as _, 0, 180, LWA_ALPHA); 
+        SetWindowPos(bg_hwnd, HWND_TOPMOST as _, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        ShowWindow(bg_hwnd, SW_HIDE);
+
+        let fg_hwnd = osd_fg_win.raw_handle();
+        DwmSetWindowAttribute(fg_hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &preference as *const u32 as *const c_void, 4);
+        let mut ex_style_fg = get_win_long(fg_hwnd, GWL_EXSTYLE);
+        ex_style_fg |= WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE;
+        set_win_long(fg_hwnd, GWL_EXSTYLE, ex_style_fg);
+        SetLayeredWindowAttributes(fg_hwnd as _, 0x00000000, 0, LWA_COLORKEY);
+        SetWindowPos(fg_hwnd, HWND_TOPMOST as _, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        ShowWindow(fg_hwnd, SW_HIDE);
+    }
 
     let config = if let Ok(file) = File::open(&config_path) {
         serde_json::from_reader(BufReader::new(file)).unwrap_or_default()
@@ -1355,34 +1378,12 @@ fn build_gui_and_run(config_path: PathBuf, osd_rx: app::Receiver<(String, f32)>)
                 osd_lbl.set_label_size((14.0 * scale) as i32);
                 osd_bar.resize((20.0 * scale) as i32, (46.0 * scale) as i32, (200.0 * scale) as i32, (6.0 * scale) as i32);
 
-                osd_bg_win.show();
-                osd_fg_win.show();
-
                 unsafe {
-                    let preference: u32 = DWMWCP_ROUND;
+                    SetWindowPos(osd_bg_win.raw_handle(), HWND_TOPMOST as _, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                    SetWindowPos(osd_fg_win.raw_handle(), HWND_TOPMOST as _, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 
-                    // --- LAYER 1: The Tinted Box ---
-                    let bg_hwnd = osd_bg_win.raw_handle();
-                    DwmSetWindowAttribute(bg_hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &preference as *const u32 as *const c_void, 4);
-
-                    let mut ex_style = get_win_long(bg_hwnd, GWL_EXSTYLE);
-                    ex_style |= WS_EX_LAYERED | WS_EX_TRANSPARENT; 
-                    set_win_long(bg_hwnd, GWL_EXSTYLE, ex_style);
-                    
-                    SetLayeredWindowAttributes(bg_hwnd as _, 0, 180, LWA_ALPHA); 
-                    SetWindowPos(bg_hwnd, HWND_TOPMOST as *mut c_void, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-
-                    // --- LAYER 2: The Text ---
-                    let fg_hwnd = osd_fg_win.raw_handle();
-                    DwmSetWindowAttribute(fg_hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &preference as *const u32 as *const c_void, 4);
-
-                    let mut ex_style_fg = get_win_long(fg_hwnd, GWL_EXSTYLE);
-                    ex_style_fg |= WS_EX_LAYERED | WS_EX_TRANSPARENT; 
-                    set_win_long(fg_hwnd, GWL_EXSTYLE, ex_style_fg);
-
-                    SetLayeredWindowAttributes(fg_hwnd as _, 0x00000000, 0, LWA_COLORKEY);
-
-                    SetWindowPos(fg_hwnd, HWND_TOPMOST as *mut c_void, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+                    ShowWindow(osd_bg_win.raw_handle(), SW_SHOWNA);
+                    ShowWindow(osd_fg_win.raw_handle(), SW_SHOWNA);
                 }
                 
                 osd_is_visible = true;
@@ -1394,8 +1395,10 @@ fn build_gui_and_run(config_path: PathBuf, osd_rx: app::Receiver<(String, f32)>)
         }
 
         if osd_is_visible && last_osd_update.elapsed() > Duration::from_millis(1500) {
-            osd_bg_win.hide();
-            osd_fg_win.hide();
+            unsafe {
+                ShowWindow(osd_bg_win.raw_handle(), SW_HIDE);
+                ShowWindow(osd_fg_win.raw_handle(), SW_HIDE);
+            }
             osd_is_visible = false;
         }
 
