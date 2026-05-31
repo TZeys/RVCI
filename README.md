@@ -31,6 +31,7 @@ This project is quite customizable. For my version that I personally use you nee
 
 - Arduino Nano
 - 5x 10k Potentiometers
+- 5x 0.1uF ceramic lowpass filtering capacitors (these can be omitted, but are highly recommended)
 - A 3-Way Toggle Switch
 - Whatever enclosure you can come up with (3D printed, breadboard, shoebox, whatever)
 
@@ -54,13 +55,14 @@ Please note that you can add as many Pots as you want, but only **1** ! 3-Way sw
 ## Schematic
 **Without Mute Buttons:**
 
-<img width="800" height="250" alt="image" src="https://github.com/user-attachments/assets/0705bf48-d2b6-495b-8a2f-7d2ab18cc0a7" />
+<img width="2424" height="963" alt="image" src="https://github.com/user-attachments/assets/3059f16c-4712-489b-8ead-a9e450b7377e" />
+
 
 **With Mute Buttons:**
 
-<img width="800" height="250" alt="image" src="https://github.com/user-attachments/assets/4a55e12b-b331-46dd-9bd1-0a4c260ff85b" />
+<img width="2419" height="1035" alt="image" src="https://github.com/user-attachments/assets/0dc52c81-1117-42c8-a6c5-0331e54a30c7" />
 
-note: these mute buttons function without any changes to the arduino firmware. No firmware upgrades needed
+
 
 
 
