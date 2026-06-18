@@ -62,8 +62,7 @@ Please note that you can add as many Pots as you want, but only **1** ! 3-Way sw
 
 <img width="2419" height="1035" alt="image" src="https://github.com/user-attachments/assets/0dc52c81-1117-42c8-a6c5-0331e54a30c7" />
 
-
-
+(lowpass capacitors are not essential, but help filter out noise. don't stress yourself if you dont have any)
 
 
 ## Upcoming features and bugfixes
