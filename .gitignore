@@ -1,0 +1,4 @@
+target/
+*.pdb
+
+Screenshot *.png

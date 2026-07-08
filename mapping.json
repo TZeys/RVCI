@@ -1,37 +1,14 @@
 {
   "serial": {
-    "port": "COM11",
+    "port": "COM1",
     "baud": 115200,
-    "timeout": 1
+    "timeout": 50
   },
   "value_max": 1024.0,
-  "work_device_1": "7- AIR 192 4",
-  "work_device_2": "NVIDIA High Definition Audio",
-  "dials": [
-    {
-      "type": "system",
-      "process_name": null,
-      "inverted": false
-    },
-    {
-      "type": "process",
-      "process_name": "brave.exe",
-      "inverted": false
-    },
-    {
-      "type": "process",
-      "process_name": null,
-      "inverted": false
-    },
-    {
-      "type": "all_others",
-      "process_name": null,
-      "inverted": false
-    },
-    {
-      "type": "process",
-      "process_name": "discord.exe",
-      "inverted": false
-    }
-  ]
+  "work_device_1": "None",
+  "work_device_2": "None",
+  "debug_mode": false,
+  "use_logarithmic_scale": false,
+  "enable_osd": true,
+  "dials": []
 }
