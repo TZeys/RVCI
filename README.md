@@ -106,7 +106,7 @@ const int buttonPins[NUM_BUTTONS] = {2, 3, 4, 5, 6}; // edit freely
 3. Fill in the second dropdown:
    - Mute Knob: pick which knob it should mute.
    - Media: pick the media key.
-   - Keys: click the field and press the combo you want. It gets recorded live (e.g. `Ctrl + Alt + Del`).
+   - Keys: click the field and press the combo you want. It gets recorded live
 4. Click **Save Changes** and you're done.
 
 ### Keys you can't map
