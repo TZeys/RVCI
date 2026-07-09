@@ -21,7 +21,8 @@ The GUI lets you intuitively create, modify and delete knob mappings. Each knob 
 Furthermore, you can choose between a linear volume curve, or a logarithmic MacOS style curve. Choose Logarithmic incase you want more fine adjustments in the low end, and less in the high end. In case you want to see a debug console, launch at startup or have an OSD, you can select those
 in the GUI as well. If you like a more old-school deej-style config, you can find mapping.json in AppData\Roaming\RVCI.
 
-<img width="262" height="428" alt="image" src="https://github.com/user-attachments/assets/5ccc2398-f27c-45f7-a00d-da886ec10851" />
+<img width="312" height="448" alt="image" src="https://github.com/user-attachments/assets/ab846242-0e55-40b5-8245-c938adcc5b97" />
+
 <img width="514" height="92" alt="image" src="https://github.com/user-attachments/assets/ea747f7d-797f-4446-bf67-ec439207486a" />
 
 
