@@ -1914,7 +1914,8 @@ impl RvciApp {
                     }
 
                     if ghost_button(ui, "Close", egui::vec2(0.0, 32.0)).clicked() {
-                        ui.ctx().send_viewport_cmd(ViewportCommand::Visible(false));
+                        self.user_opened.store(false, Ordering::SeqCst);
+                        hide_window_native(self.hwnd);
                     }
 
                     if ghost_button(ui, "Themes", egui::vec2(0.0, 32.0)).clicked() {
