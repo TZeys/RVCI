@@ -65,7 +65,7 @@ Please note that you can add as many Pots as you want, but only **1** ! 3-Way sw
 
 ## Virtual / Output device volume control
 
-You can also map a knob straight to a specific output device instead of a process. I mainly use this for SteelSeries Sonar, but it works just as well with Voicemeeter or anything else that exposes virtual output devices to Windows. Each virtual channel (Game, Chat, Media, Aux and so on) shows up as its own output in Windows, so you can give every channel its own knob.
+You can also map a knob straight to a specific output device instead of a process. Each virtual channel (Game, Chat, Media, Aux and so on) shows up as its own output in Windows, so you can give every channel its own knob.
 
 To set it up, open Settings and add or edit a knob mapping, set the knob **type** to **Output Device**, then pick the output you want (e.g. "Game (SteelSeries Sonar - Gaming)") from the list. Save, and that knob now controls the master volume of that output. If a new virtual device shows up after RVCI is already running, just hit the **Update** button in the top right to refresh the list.
 
