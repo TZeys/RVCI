@@ -1915,7 +1915,7 @@ impl RvciApp {
 
                     if ghost_button(ui, "Close", egui::vec2(0.0, 32.0)).clicked() {
                         self.user_opened.store(false, Ordering::SeqCst);
-                        hide_window_native(self.hwnd);
+                        park_window_native(self.hwnd);
                     }
 
                     if ghost_button(ui, "Themes", egui::vec2(0.0, 32.0)).clicked() {
@@ -2109,7 +2109,7 @@ impl eframe::App for RvciApp {
         }
 
         if !self.user_opened.load(Ordering::SeqCst) {
-            hide_window_native(self.hwnd);
+            park_window_native(self.hwnd);
             return;
         }
 
@@ -2120,7 +2120,7 @@ impl eframe::App for RvciApp {
         if ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             self.user_opened.store(false, Ordering::SeqCst);
-            hide_window_native(self.hwnd);
+            park_window_native(self.hwnd);
         }
 
         self.handle_key_capture(ctx);
@@ -2132,18 +2132,28 @@ impl eframe::App for RvciApp {
     }
 }
 
+const PARK_POS: i32 = -32000;
+
 fn show_window_native(hwnd: isize) {
     if hwnd == 0 {
         return;
     }
     use windows::Win32::Foundation::{HWND, RECT};
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetWindowRect, IsIconic, SetForegroundWindow, SetWindowPos, ShowWindow,
-        SystemParametersInfoW, SPI_GETWORKAREA, SWP_NOSIZE, SWP_NOZORDER,
-        SW_RESTORE, SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+        GetWindowLongPtrW, GetWindowRect, IsIconic, SetForegroundWindow, SetWindowLongPtrW,
+        SetWindowPos, ShowWindow, SystemParametersInfoW, GWL_EXSTYLE, SPI_GETWORKAREA,
+        SWP_FRAMECHANGED, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOW,
+        SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
     };
     let hwnd = HWND(hwnd as *mut c_void);
     unsafe {
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        if ex & WS_EX_TOOLWINDOW.0 != 0 {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+            let restored = (ex & !WS_EX_TOOLWINDOW.0) | WS_EX_APPWINDOW.0;
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, restored as isize);
+        }
+
         let mut rc = RECT::default();
         if GetWindowRect(hwnd, &mut rc).is_ok() && rc.left <= -20000 {
             let mut work = RECT::default();
@@ -2157,7 +2167,7 @@ fn show_window_native(hwnd: isize) {
             let h = rc.bottom - rc.top;
             let x = work.left + ((work.right - work.left) - w).max(0) / 2;
             let y = work.top + ((work.bottom - work.top) - h).max(0) / 2;
-            let _ = SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+            let _ = SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
         }
         if IsIconic(hwnd).as_bool() {
             let _ = ShowWindow(hwnd, SW_RESTORE);
@@ -2168,15 +2178,38 @@ fn show_window_native(hwnd: isize) {
     }
 }
 
-fn hide_window_native(hwnd: isize) {
+fn park_window_native(hwnd: isize) {
     if hwnd == 0 {
         return;
     }
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+    use windows::Win32::Foundation::{HWND, RECT};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, GetWindowRect, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+        GWL_EXSTYLE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE,
+        SW_SHOWNOACTIVATE, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    };
     let hwnd = HWND(hwnd as *mut c_void);
     unsafe {
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        let mut rc = RECT::default();
+        let off_screen = GetWindowRect(hwnd, &mut rc).is_ok() && rc.left <= -20000;
+        if off_screen && ex & WS_EX_TOOLWINDOW.0 != 0 {
+            return;
+        }
+
         let _ = ShowWindow(hwnd, SW_HIDE);
+        let parked = (ex & !WS_EX_APPWINDOW.0) | WS_EX_TOOLWINDOW.0;
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, parked as isize);
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            PARK_POS,
+            PARK_POS,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     }
 }
 
