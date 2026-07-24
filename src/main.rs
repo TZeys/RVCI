@@ -155,6 +155,26 @@ fn get_config_path() -> PathBuf {
     path.join("mapping.json")
 }
 
+fn acquire_single_instance() -> bool {
+    use windows::core::w;
+    use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+    use windows::Win32::System::Threading::CreateMutexW;
+
+    unsafe {
+        match CreateMutexW(None, true, w!("RVCI_SINGLE_INSTANCE")) {
+            Ok(handle) => {
+                if GetLastError() == ERROR_ALREADY_EXISTS {
+                    let _ = CloseHandle(handle);
+                    false
+                } else {
+                    true
+                }
+            }
+            Err(_) => true,
+        }
+    }
+}
+
 const STARTUP_VALUE: &str = "RVCI";
 
 const STARTUP_VALUE_LEGACY: &str = "RVSC";
@@ -1479,8 +1499,8 @@ impl RvciApp {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Configuration").size(17.0).strong().color(text()));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ghost_button(ui, "Update", egui::vec2(0.0, 30.0))
-                    .on_hover_text("Rescan devices and processes")
+                if ghost_button(ui, "Rescan COM", egui::vec2(0.0, 30.0))
+                    .on_hover_text("Rescan COM ports, audio devices and running apps")
                     .clicked()
                 {
                     self.rescan();
@@ -2802,6 +2822,10 @@ mod osd {
 }
 
 fn main() -> Result<()> {
+
+    if !acquire_single_instance() {
+        return Ok(());
+    }
 
     register_toast_identity();
 
