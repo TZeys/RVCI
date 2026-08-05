@@ -781,6 +781,10 @@ struct AppConfig {
     theme: String,
     #[serde(default = "default_osd_style")]
     osd_style: String,
+    #[serde(default = "default_osd_position")]
+    osd_position: String,
+    #[serde(default)]
+    osd_monitor: String,
     dials: Vec<DialConfig>,
     #[serde(default)]
     buttons: Vec<ButtonConfig>,
@@ -803,6 +807,92 @@ fn osd_is_mono() -> bool {
     OSD_MONO.load(Ordering::Relaxed)
 }
 
+fn default_osd_position() -> String { OSD_POSITIONS[0].to_string() }
+
+const OSD_POSITIONS: [&str; 8] = [
+    "bottom",
+    "top",
+    "left",
+    "right",
+    "top-left",
+    "top-right",
+    "bottom-left",
+    "bottom-right",
+];
+const OSD_POSITION_LABELS: [&str; 8] = [
+    "Bottom",
+    "Top",
+    "Left",
+    "Right",
+    "Top left",
+    "Top right",
+    "Bottom left",
+    "Bottom right",
+];
+
+static OSD_POS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static OSD_MONITOR: Mutex<String> = Mutex::new(String::new());
+
+fn osd_position_index(name: &str) -> usize {
+    OSD_POSITIONS.iter().position(|p| *p == name).unwrap_or(0)
+}
+
+fn set_osd_position(name: &str) {
+    OSD_POS.store(osd_position_index(name), Ordering::Relaxed);
+}
+
+fn osd_position() -> usize {
+    OSD_POS.load(Ordering::Relaxed)
+}
+
+fn set_osd_monitor(device: &str) {
+    if let Ok(mut slot) = OSD_MONITOR.lock() {
+        if slot.as_str() != device {
+            slot.clear();
+            slot.push_str(device);
+        }
+    }
+}
+
+fn osd_monitor() -> String {
+    OSD_MONITOR.lock().map(|s| s.clone()).unwrap_or_default()
+}
+
+fn osd_anchor(pos: usize) -> (u8, u8) {
+    match OSD_POSITIONS.get(pos).copied().unwrap_or(OSD_POSITIONS[0]) {
+        "top" => (1, 0),
+        "left" => (0, 1),
+        "right" => (2, 1),
+        "top-left" => (0, 0),
+        "top-right" => (2, 0),
+        "bottom-left" => (0, 2),
+        "bottom-right" => (2, 2),
+        _ => (1, 2),
+    }
+}
+
+fn osd_placement(
+    work: (i32, i32, i32, i32),
+    w: i32,
+    h: i32,
+    margin: i32,
+    pos: usize,
+) -> (i32, i32) {
+    let (left, top, right, bottom) = work;
+    let (hx, vy) = osd_anchor(pos);
+    let x = match hx {
+        0 => left + margin,
+        2 => right - w - margin,
+        _ => left + (right - left - w) / 2,
+    };
+    let y = match vy {
+        0 => top + margin,
+        2 => bottom - h - margin,
+        _ => top + (bottom - top - h) / 2,
+    };
+    (x, y)
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -815,6 +905,8 @@ impl Default for AppConfig {
             enable_osd: true,
             theme: default_theme(),
             osd_style: default_osd_style(),
+            osd_position: default_osd_position(),
+            osd_monitor: String::new(),
             dials: vec![],
             buttons: vec![],
         }
@@ -879,6 +971,10 @@ fn sanitize_config(cfg: &mut AppConfig) {
     if !OSD_STYLES.contains(&cfg.osd_style.as_str()) {
         cfg.osd_style = default_osd_style();
     }
+    if !OSD_POSITIONS.contains(&cfg.osd_position.as_str()) {
+        cfg.osd_position = default_osd_position();
+    }
+    clip_chars(&mut cfg.osd_monitor, MAX_NAME_CHARS);
 
     cfg.dials.truncate(MAX_DIALS);
     cfg.buttons.truncate(MAX_BUTTONS);
@@ -919,7 +1015,12 @@ fn load_config(path: &Path) -> ConfigLoad {
     let Ok(file) = File::open(path) else {
         return ConfigLoad::Missing;
     };
-    let reader = BufReader::new(file.take(MAX_CONFIG_BYTES));
+    let mut reader = BufReader::new(file.take(MAX_CONFIG_BYTES));
+    if let Ok(head) = reader.fill_buf() {
+        if head.starts_with(&[0xEF, 0xBB, 0xBF]) {
+            reader.consume(3);
+        }
+    }
     match serde_json::from_reader::<_, AppConfig>(reader) {
         Ok(mut cfg) => {
             sanitize_config(&mut cfg);
@@ -1573,6 +1674,8 @@ fn run_volume_logic_loop(config_path: PathBuf, osd_tx: Sender<OsdMsg>, ui: UiLin
     loop {
         if let ConfigLoad::Loaded(config) = load_config(&config_path) {
             set_osd_style(&config.osd_style);
+            set_osd_position(&config.osd_position);
+            set_osd_monitor(&config.osd_monitor);
             diag::set_console(config.debug_mode, "config on disk");
             let new_sig = format!("{}{}", config.serial.port, config.serial.baud);
             if new_sig != current_config_sig {
@@ -1776,6 +1879,8 @@ fn run_serial_processing(
                         match load_config(config_path) {
                             ConfigLoad::Loaded(next) => {
                                 set_osd_style(&next.osd_style);
+                                set_osd_position(&next.osd_position);
+                                set_osd_monitor(&next.osd_monitor);
                                 diag::set_console(next.debug_mode, "config file changed");
                                 if serial_settings_changed(config, &next) {
                                     log_info!("serial: settings changed on disk, restarting the loop");
@@ -2478,10 +2583,18 @@ struct RvciApp {
     github_tex: Option<egui::TextureHandle>,
 
     show_themes: bool,
+    show_osd_spot: bool,
+    monitors: Vec<MonitorInfo>,
+    osd_tx: Sender<OsdMsg>,
 }
 
 impl RvciApp {
-    fn new(cc: &eframe::CreationContext<'_>, config_path: PathBuf, link: UiLink) -> Self {
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        config_path: PathBuf,
+        link: UiLink,
+        osd_tx: Sender<OsdMsg>,
+    ) -> Self {
         install_fonts(&cc.egui_ctx);
         configure_visuals(&cc.egui_ctx);
 
@@ -2497,6 +2610,8 @@ impl RvciApp {
         if cfg.theme == "RVCI Pink" { cfg.theme = "Pink".to_string(); }
         set_theme_by_name(&cfg.theme);
         set_osd_style(&cfg.osd_style);
+        set_osd_position(&cfg.osd_position);
+        set_osd_monitor(&cfg.osd_monitor);
 
         let open_item = MenuItem::new("Open Settings", true, None);
         let quit_item = MenuItem::new("Quit", true, None);
@@ -2615,6 +2730,9 @@ impl RvciApp {
             proc_rx,
             github_tex: None,
             show_themes: false,
+            show_osd_spot: false,
+            monitors: list_monitors(),
+            osd_tx,
         };
         app.rescan();
         app
@@ -2627,13 +2745,26 @@ impl RvciApp {
         self.capture_devices = AudioScanner::get_capture_devices_with_ids()
             .into_iter().map(|d| d.0).collect();
         self.active_processes = AudioScanner::get_active_sessions();
+        self.monitors = list_monitors();
         log_info!(
-            "ui: rescan found {} COM ports, {} playback, {} capture, {} audio apps",
+            "ui: rescan found {} COM ports, {} playback, {} capture, {} audio apps, {} displays",
             self.com_ports.len(),
             self.playback_devices.len(),
             self.capture_devices.len(),
-            self.active_processes.len()
+            self.active_processes.len(),
+            self.monitors.len()
         );
+    }
+
+    fn preview_osd(&self) {
+        let msg = OsdMsg {
+            label: "Preview".to_string(),
+            level: 0.66,
+            muted: false,
+        };
+        if self.osd_tx.send(msg).is_err() {
+            log_warn!("ui: the OSD thread is gone, cannot preview the position");
+        }
     }
 
     fn persist_debug_flag(&mut self, enabled: bool) {
@@ -2679,13 +2810,15 @@ impl RvciApp {
         let ok = save_config(&self.config_path, &self.cfg);
         if ok {
             log_info!(
-                "config: saved, port={} baud={} dials={} buttons={} theme={} osd={} debug_console={} startup={}",
+                "config: saved, port={} baud={} dials={} buttons={} theme={} osd={} spot={} display={} debug_console={} startup={}",
                 self.cfg.serial.port,
                 self.cfg.serial.baud,
                 self.cfg.dials.len(),
                 self.cfg.buttons.len(),
                 self.cfg.theme,
                 self.cfg.enable_osd,
+                self.cfg.osd_position,
+                if self.cfg.osd_monitor.is_empty() { "primary" } else { self.cfg.osd_monitor.as_str() },
                 self.cfg.debug_mode,
                 self.startup_enabled
             );
@@ -2829,6 +2962,7 @@ impl RvciApp {
             });
 
         self.themes_window(ctx);
+        self.osd_spot_window(ctx);
     }
 
     fn section_header(&mut self, ui: &mut egui::Ui) {
@@ -3000,6 +3134,142 @@ impl RvciApp {
                 }
             });
         self.show_themes = open;
+    }
+
+    fn osd_spot_window(&mut self, ctx: &egui::Context) {
+        if !self.show_osd_spot {
+            return;
+        }
+
+        let screen = ctx.screen_rect();
+        let backdrop = egui::Area::new(egui::Id::new("osd_spot_backdrop"))
+            .order(egui::Order::Middle)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                let (rect, resp) = ui.allocate_exact_size(screen.size(), egui::Sense::click());
+                ui.painter()
+                    .rect_filled(rect, egui::Rounding::ZERO, Color32::from_black_alpha(150));
+                resp
+            });
+        if backdrop.inner.clicked() {
+            self.show_osd_spot = false;
+        }
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.show_osd_spot = false;
+            return;
+        }
+
+        let mut open = self.show_osd_spot;
+        let frame = egui::Frame::window(&ctx.style())
+            .fill(card_bg())
+            .stroke(egui::Stroke::new(1.0, card_border()))
+            .rounding(egui::Rounding::same(18.0))
+            .inner_margin(egui::Margin::same(22.0))
+            .shadow(egui::epaint::Shadow {
+                offset: egui::vec2(0.0, 16.0),
+                blur: 44.0,
+                spread: 0.0,
+                color: Color32::from_black_alpha(140),
+            });
+
+        let mut moved = false;
+        egui::Window::new(RichText::new("OSD position").font(semibold(16.0)))
+            .open(&mut open)
+            .order(egui::Order::Foreground)
+            .collapsible(false)
+            .resizable(false)
+            .frame(frame)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_width(384.0);
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.add_space(2.0);
+
+                let cur = osd_position_index(&self.cfg.osd_position);
+                if let Some(pick) = spot_picker(ui, cur) {
+                    if pick != cur {
+                        self.cfg.osd_position = OSD_POSITIONS[pick].to_string();
+                        set_osd_position(&self.cfg.osd_position);
+                        log_info!("ui: OSD position set to {}", OSD_POSITIONS[pick]);
+                        moved = true;
+                    }
+                }
+
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(OSD_POSITION_LABELS[osd_position_index(
+                            &self.cfg.osd_position,
+                        )])
+                        .font(regular(14.0))
+                        .color(text()),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new("Click a spot to move it")
+                                .font(regular(12.5))
+                                .color(text_faint()),
+                        );
+                    });
+                });
+
+                ui.add_space(18.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(1.0);
+                    section_title(ui, "Display");
+                });
+                ui.add_space(9.0);
+
+                if self.monitors.len() < 2 {
+                    ui.label(
+                        RichText::new("Only one display is connected, so the OSD always lands there.")
+                            .font(regular(13.0))
+                            .color(text_faint()),
+                    );
+                } else {
+                    let active = pick_monitor(&self.monitors, &self.cfg.osd_monitor)
+                        .map(|m| m.device.clone())
+                        .unwrap_or_default();
+                    if let Some(device) = monitor_map(ui, &self.monitors, &active) {
+                        if device != self.cfg.osd_monitor {
+                            self.cfg.osd_monitor = device;
+                            set_osd_monitor(&self.cfg.osd_monitor);
+                            log_info!("ui: OSD display pinned to {}", self.cfg.osd_monitor);
+                            moved = true;
+                        }
+                    }
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        let pinned = !self.cfg.osd_monitor.is_empty();
+                        let note = if pinned {
+                            "Pinned to this display"
+                        } else {
+                            "Following whichever display is primary"
+                        };
+                        ui.label(RichText::new(note).font(regular(12.5)).color(text_faint()));
+                        if pinned {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if text_button(ui, "Follow primary").clicked() {
+                                        self.cfg.osd_monitor.clear();
+                                        set_osd_monitor("");
+                                        log_info!("ui: OSD display back to the primary one");
+                                        moved = true;
+                                    }
+                                },
+                            );
+                        }
+                    });
+                }
+                ui.add_space(4.0);
+            });
+
+        if moved {
+            self.preview_osd();
+        }
+        self.show_osd_spot = open;
     }
 
     fn section_routing(&mut self, ui: &mut egui::Ui) {
@@ -3309,6 +3579,24 @@ impl RvciApp {
                             log_info!("ui: OSD style changed to {}", OSD_STYLES[pick]);
                             self.cfg.osd_style = OSD_STYLES[pick].to_string();
                             set_osd_style(&self.cfg.osd_style);
+                        }
+                    });
+                });
+            });
+            let summary = osd_target_summary(&self.cfg, &self.monitors);
+            rows.item(ui, |ui| {
+                ui.horizontal(|ui| {
+                    label_cell_enabled(ui, "OSD position", osd_on);
+                    let w = ui.available_width();
+                    ui.add_enabled_ui(osd_on, |ui| {
+                        if disclosure(ui, &summary, w) {
+                            self.monitors = list_monitors();
+                            self.show_osd_spot = true;
+                            log_info!(
+                                "ui: OSD position picker opened, {} displays",
+                                self.monitors.len()
+                            );
+                            self.preview_osd();
                         }
                     });
                 });
@@ -3711,6 +3999,246 @@ fn chevron(painter: &egui::Painter, center: egui::Pos2, color: Color32, up: bool
     let c = egui::pos2(center.x + half_w, center.y - half_h * 0.5);
     painter.line_segment([a, b], stroke);
     painter.line_segment([b, c], stroke);
+}
+
+fn chevron_right(painter: &egui::Painter, center: egui::Pos2, color: Color32) {
+    let stroke = egui::Stroke::new(1.7, color);
+    let a = egui::pos2(center.x - 1.7, center.y - 4.3);
+    let b = egui::pos2(center.x + 2.3, center.y);
+    let c = egui::pos2(center.x - 1.7, center.y + 4.3);
+    painter.line_segment([a, b], stroke);
+    painter.line_segment([b, c], stroke);
+}
+
+fn disclosure(ui: &mut egui::Ui, value: &str, width: f32) -> bool {
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(width.max(56.0), 26.0), egui::Sense::click());
+    let enabled = ui.is_enabled();
+    let hot = ui.ctx().animate_bool(resp.id, resp.hovered() && enabled);
+    let dim = |c: Color32| if enabled { c } else { mix(c, card_bg(), 0.55) };
+    let rounding = egui::Rounding::same(9.0);
+    let pad = 4.0;
+    let chev_w = 20.0;
+
+    if hot > 0.0 {
+        let c = row_hover();
+        ui.painter().rect_filled(
+            rect,
+            rounding,
+            Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (hot * 80.0) as u8),
+        );
+    }
+    if resp.has_focus() {
+        ui.painter()
+            .rect_stroke(rect, rounding, egui::Stroke::new(2.0, accent()));
+    }
+
+    let col = dim(text_muted());
+    let avail = (rect.width() - pad * 2.0 - chev_w - 4.0).max(10.0);
+    let shown = elide(ui, value, regular(14.0), avail);
+    let galley = ui.painter().layout_no_wrap(shown, regular(14.0), col);
+    ui.painter().galley(
+        egui::pos2(
+            rect.right() - pad - chev_w - galley.size().x,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        col,
+    );
+    chevron_right(
+        ui.painter(),
+        egui::pos2(rect.right() - pad - chev_w * 0.5, rect.center().y),
+        dim(text_faint()),
+    );
+
+    enabled && resp.clicked()
+}
+
+const SPOT_MARGIN: f32 = 12.0;
+const SPOT_H: f32 = 26.0;
+const SPOT_R: f32 = 6.0;
+const SCREEN_R: f32 = SPOT_MARGIN + SPOT_R;
+
+fn spot_plate(painter: &egui::Painter, rect: egui::Rect, fill: Color32) {
+    painter.rect_filled(rect, egui::Rounding::same(SPOT_R), fill);
+}
+
+fn spot_picker(ui: &mut egui::Ui, current: usize) -> Option<usize> {
+    let w = ui.available_width().max(240.0);
+    let h = (w * 9.0 / 16.0).round();
+    let (screen, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
+
+    ui.painter()
+        .rect_filled(screen, egui::Rounding::same(SCREEN_R), bg());
+    ui.painter().rect_stroke(
+        screen,
+        egui::Rounding::same(SCREEN_R),
+        egui::Stroke::new(1.0, card_border()),
+    );
+
+    let spot_w = (w * 0.24).round();
+    let bounds = (
+        screen.left() as i32,
+        screen.top() as i32,
+        screen.right() as i32,
+        screen.bottom() as i32,
+    );
+    let slot = |i: usize| {
+        let (x, y) = osd_placement(
+            bounds,
+            spot_w as i32,
+            SPOT_H as i32,
+            SPOT_MARGIN as i32,
+            i,
+        );
+        egui::Rect::from_min_size(
+            egui::pos2(x as f32, y as f32),
+            egui::vec2(spot_w, SPOT_H),
+        )
+    };
+    let zone = |i: usize| {
+        let (hx, vy) = osd_anchor(i);
+        egui::Rect::from_min_size(
+            egui::pos2(
+                screen.left() + screen.width() / 3.0 * hx as f32,
+                screen.top() + screen.height() / 3.0 * vy as f32,
+            ),
+            egui::vec2(screen.width() / 3.0, screen.height() / 3.0),
+        )
+    };
+
+    let mut picked = None;
+    let ink = text();
+    for i in 0..OSD_POSITIONS.len() {
+        let resp = ui.interact(zone(i), ui.id().with(("osd_spot", i)), egui::Sense::click());
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if resp.clicked() {
+            picked = Some(i);
+        }
+        if i == current {
+            continue;
+        }
+        let lit = ui.ctx().animate_bool(resp.id, resp.hovered());
+        spot_plate(ui.painter(), slot(i), mix(bg(), ink, 0.15 + lit * 0.15));
+    }
+
+    let goal = slot(current);
+    let id = ui.id().with("osd_spot_slide");
+    let cx = ui.ctx().animate_value_with_time(id.with("x"), goal.center().x, 0.16);
+    let cy = ui.ctx().animate_value_with_time(id.with("y"), goal.center().y, 0.16);
+    let live = egui::Rect::from_center_size(egui::pos2(cx, cy), goal.size());
+
+    spot_plate(
+        ui.painter(),
+        live.translate(egui::vec2(0.0, 2.0)),
+        Color32::from_black_alpha(36),
+    );
+    spot_plate(ui.painter(), live, accent());
+
+    let face = contrast_text(accent());
+    let tint = |a: u8| Color32::from_rgba_unmultiplied(face.r(), face.g(), face.b(), a);
+    let pad = (spot_w * 0.065).round().max(5.0);
+    let inner_w = live.width() - pad * 2.0;
+    let mark = |x: f32, y: f32, w: f32, h: f32, a: u8| {
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h)),
+            egui::Rounding::same(h * 0.5),
+            tint(a),
+        );
+    };
+    mark(live.left() + pad, live.top() + 7.0, inner_w * 0.3, 4.0, 210);
+    mark(live.right() - pad - inner_w * 0.18, live.top() + 7.0, inner_w * 0.18, 4.0, 150);
+    mark(live.left() + pad, live.bottom() - 9.5, inner_w, 3.5, 55);
+    mark(live.left() + pad, live.bottom() - 9.5, inner_w * 0.62, 3.5, 255);
+
+    picked
+}
+
+fn monitor_map(ui: &mut egui::Ui, monitors: &[MonitorInfo], active: &str) -> Option<String> {
+    let avail = ui.available_width().max(200.0);
+    let min_x = monitors.iter().map(|m| m.bounds.0).min().unwrap_or(0) as f32;
+    let min_y = monitors.iter().map(|m| m.bounds.1).min().unwrap_or(0) as f32;
+    let max_x = monitors.iter().map(|m| m.bounds.2).max().unwrap_or(1) as f32;
+    let max_y = monitors.iter().map(|m| m.bounds.3).max().unwrap_or(1) as f32;
+    let span_x = (max_x - min_x).max(1.0);
+    let span_y = (max_y - min_y).max(1.0);
+    let scale = (avail / span_x).min(138.0 / span_y);
+
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(avail, span_y * scale), egui::Sense::hover());
+    let origin = egui::pos2(rect.center().x - span_x * scale / 2.0, rect.top());
+
+    let mut picked = None;
+    for m in monitors {
+        let tile = egui::Rect::from_min_size(
+            origin
+                + egui::vec2(
+                    (m.bounds.0 as f32 - min_x) * scale,
+                    (m.bounds.1 as f32 - min_y) * scale,
+                ),
+            egui::vec2(m.width() as f32 * scale, m.height() as f32 * scale),
+        );
+        let tile = if tile.width() > 14.0 && tile.height() > 14.0 {
+            tile.shrink(3.0)
+        } else {
+            tile
+        };
+        let resp = ui.interact(tile, ui.id().with(&m.device), egui::Sense::click());
+        if resp.clicked() {
+            picked = Some(m.device.clone());
+        }
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+
+        let selected = m.device == active;
+        let round = egui::Rounding::same(9.0);
+        let fill = if selected {
+            mix(widget_bg(), accent(), 0.2)
+        } else {
+            widget_bg()
+        };
+        let (sw, sc) = if selected {
+            (2.0, accent())
+        } else if resp.hovered() {
+            (1.0, text_faint())
+        } else {
+            (1.0, card_border())
+        };
+        ui.painter().rect_filled(tile, round, fill);
+        ui.painter()
+            .rect_stroke(tile, round, egui::Stroke::new(sw, sc));
+
+        let mut lines: Vec<(String, egui::FontId, Color32)> =
+            vec![(m.number.to_string(), semibold(15.0), text())];
+        if tile.height() > 46.0 {
+            lines.push((
+                format!("{} x {}", m.width(), m.height()),
+                regular(10.5),
+                text_faint(),
+            ));
+        }
+        if m.primary && tile.height() > 64.0 {
+            lines.push(("Primary".to_string(), regular(10.5), text_faint()));
+        }
+        let total: f32 = lines.iter().map(|(_, f, _)| f.size + 2.0).sum();
+        let mut y = tile.center().y - total / 2.0;
+        for (line, font, col) in lines {
+            let step = font.size + 2.0;
+            ui.painter().text(
+                egui::pos2(tile.center().x, y + step / 2.0),
+                egui::Align2::CENTER_CENTER,
+                line,
+                font,
+                col,
+            );
+            y += step;
+        }
+    }
+
+    picked
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -4296,6 +4824,128 @@ fn routing_display(stored: &str, devices: &[String]) -> String {
     stored.to_string()
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct MonitorInfo {
+    device: String,
+    number: u32,
+    primary: bool,
+    dpi: u32,
+    bounds: (i32, i32, i32, i32),
+    work: (i32, i32, i32, i32),
+}
+
+impl MonitorInfo {
+    fn width(&self) -> i32 {
+        self.bounds.2 - self.bounds.0
+    }
+
+    fn height(&self) -> i32 {
+        self.bounds.3 - self.bounds.1
+    }
+
+    fn label(&self) -> String {
+        if self.number == 0 {
+            "Display".to_string()
+        } else {
+            format!("Display {}", self.number)
+        }
+    }
+}
+
+fn monitor_number(device: &str) -> u32 {
+    let tail: String = device.chars().rev().take_while(|c| c.is_ascii_digit()).collect();
+    tail.chars().rev().collect::<String>().parse().unwrap_or(0)
+}
+
+fn pick_monitor<'a>(list: &'a [MonitorInfo], device: &str) -> Option<&'a MonitorInfo> {
+    if !device.is_empty() {
+        if let Some(m) = list.iter().find(|m| m.device == device) {
+            return Some(m);
+        }
+    }
+    list.iter().find(|m| m.primary).or_else(|| list.first())
+}
+
+fn list_monitors() -> Vec<MonitorInfo> {
+    use windows::core::BOOL;
+    use windows::Win32::Foundation::{LPARAM, RECT};
+    use windows::Win32::Graphics::Gdi::{
+        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
+    };
+    use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+
+    const PRIMARY_FLAG: u32 = 1;
+
+    unsafe extern "system" fn collect(
+        handle: HMONITOR,
+        _dc: HDC,
+        _clip: *mut RECT,
+        data: LPARAM,
+    ) -> BOOL {
+        if data.0 == 0 {
+            return BOOL(0);
+        }
+        let out = &mut *(data.0 as *mut Vec<MonitorInfo>);
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        let ok = GetMonitorInfoW(handle, &mut info as *mut MONITORINFOEXW as *mut MONITORINFO);
+        if ok.as_bool() {
+            let end = info
+                .szDevice
+                .iter()
+                .position(|c| *c == 0)
+                .unwrap_or(info.szDevice.len());
+            let device = String::from_utf16_lossy(&info.szDevice[..end]);
+            let mut dpi_x = 96u32;
+            let mut dpi_y = 96u32;
+            if GetDpiForMonitor(handle, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y).is_err()
+                || dpi_x == 0
+            {
+                dpi_x = 96;
+            }
+            let m = &info.monitorInfo;
+            out.push(MonitorInfo {
+                number: monitor_number(&device),
+                device,
+                primary: m.dwFlags & PRIMARY_FLAG != 0,
+                dpi: dpi_x,
+                bounds: (
+                    m.rcMonitor.left,
+                    m.rcMonitor.top,
+                    m.rcMonitor.right,
+                    m.rcMonitor.bottom,
+                ),
+                work: (m.rcWork.left, m.rcWork.top, m.rcWork.right, m.rcWork.bottom),
+            });
+        }
+        BOOL(1)
+    }
+
+    let mut out: Vec<MonitorInfo> = Vec::new();
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            None,
+            None,
+            Some(collect),
+            LPARAM(&mut out as *mut Vec<MonitorInfo> as isize),
+        );
+    }
+    out.retain(|m| m.width() > 0 && m.height() > 0);
+    out.sort_by_key(|m| (m.number, m.bounds.0, m.bounds.1));
+    out
+}
+
+fn osd_target_summary(cfg: &AppConfig, monitors: &[MonitorInfo]) -> String {
+    let label = OSD_POSITION_LABELS[osd_position_index(&cfg.osd_position)];
+    if cfg.osd_monitor.is_empty() || monitors.len() < 2 {
+        return label.to_string();
+    }
+    match monitors.iter().find(|m| m.device == cfg.osd_monitor) {
+        Some(m) => format!("{}, {}", label, m.label().to_lowercase()),
+        None => label.to_string(),
+    }
+}
+
 mod osd {
     use super::{accent, is_light_color, mix, pal, OsdMsg};
     use std::sync::mpsc::Receiver;
@@ -4641,6 +5291,8 @@ mod osd {
         let mut shown = 0.0f32;
         let mut muted = false;
 
+        let mut placed = String::new();
+        let mut target_spot = (usize::MAX, String::new());
         let mut visible = false;
         let mut pending_show = false;
         let mut holding = false;
@@ -4675,10 +5327,16 @@ mod osd {
                 deadline = Instant::now() + Duration::from_millis(HOLD_MS);
                 holding = true;
 
-                if fresh {
+                let spot = (super::osd_position(), super::osd_monitor());
+                if fresh || spot != target_spot {
+                    target_spot = spot;
                     visible = true;
-                    pending_show = true;
-                    let dpi = place_window(hwnd);
+                    pending_show = pending_show || fresh;
+                    let (dpi, note) = place_window(hwnd);
+                    if note != placed {
+                        log_debug!("osd: placed {note}");
+                        placed = note;
+                    }
                     let want = (dpi as f32 / 96.0).clamp(1.0, 4.0);
                     if canvas.is_none() || (want - scale).abs() > 0.01 {
                         scale = want;
@@ -4752,16 +5410,11 @@ mod osd {
         }
     }
 
-    unsafe fn place_window(hwnd: HWND) -> u32 {
+    unsafe fn primary_work_area(hwnd: HWND) -> ((i32, i32, i32, i32), u32) {
         let dpi = match GetDpiForWindow(hwnd) {
             0 => 96,
             d => d,
         };
-        let scale = (dpi as f32 / 96.0).clamp(1.0, 4.0);
-        let w = (BASE_W * scale).round() as i32;
-        let h = (BASE_H * scale).round() as i32;
-        let margin = (BASE_MARGIN * scale).round() as i32;
-
         let mut work = RECT::default();
         let ok = SystemParametersInfoW(
             SPI_GETWORKAREA,
@@ -4770,16 +5423,39 @@ mod osd {
             SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
         )
         .is_ok();
-        let (x, y) = if ok && work.right > work.left {
-            (
-                work.left + (work.right - work.left - w) / 2,
-                work.bottom - h - margin,
-            )
+        if ok && work.right > work.left && work.bottom > work.top {
+            ((work.left, work.top, work.right, work.bottom), dpi)
         } else {
-            ((1920 - w) / 2, 1040 - h - margin)
+            ((0, 0, 1920, 1040), dpi)
+        }
+    }
+
+    unsafe fn place_window(hwnd: HWND) -> (u32, String) {
+        let monitors = super::list_monitors();
+        let wanted = super::osd_monitor();
+        let picked = super::pick_monitor(&monitors, &wanted);
+        let (work, dpi, on) = match picked {
+            Some(m) => (m.work, m.dpi, m.device.clone()),
+            None => {
+                let (work, dpi) = primary_work_area(hwnd);
+                (work, dpi, String::from("primary"))
+            }
         };
+
+        let scale = (dpi as f32 / 96.0).clamp(1.0, 4.0);
+        let w = (BASE_W * scale).round() as i32;
+        let h = (BASE_H * scale).round() as i32;
+        let margin = (BASE_MARGIN * scale).round() as i32;
+
+        let pos = super::osd_position();
+        let (x, y) = super::osd_placement(work, w, h, margin, pos);
         let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_NOACTIVATE);
-        dpi
+
+        let mut note = format!("{} on {} at {} dpi", super::OSD_POSITIONS[pos], on, dpi);
+        if !wanted.is_empty() && on != wanted {
+            note.push_str(" (requested display is gone)");
+        }
+        (dpi, note)
     }
 
     unsafe fn present(hwnd: HWND, canvas: &Canvas) {
@@ -4976,9 +5652,21 @@ mod osd {
 }
 
 
+fn enable_per_monitor_dpi() {
+    use windows::Win32::UI::HiDpi::{
+        SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    };
+    let set = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+    match set {
+        Ok(()) => log_debug!("app: per monitor dpi awareness enabled"),
+        Err(e) => log_debug!("app: dpi awareness was already decided ({e})"),
+    }
+}
+
 fn main() -> Result<()> {
     diag::init(get_log_dir());
     log_info!("app: RVCI {} starting", env!("CARGO_PKG_VERSION"));
+    enable_per_monitor_dpi();
     for line in diag::environment().lines() {
         let line = line.trim_end();
         if !line.is_empty() {
@@ -5001,13 +5689,15 @@ fn main() -> Result<()> {
     match load_config(&path) {
         ConfigLoad::Loaded(cfg) => {
             log_info!(
-                "config: loaded, port={} baud={} dials={} buttons={} osd={} style={} theme={} debug_console={}",
+                "config: loaded, port={} baud={} dials={} buttons={} osd={} style={} spot={} display={} theme={} debug_console={}",
                 cfg.serial.port,
                 cfg.serial.baud,
                 cfg.dials.len(),
                 cfg.buttons.len(),
                 cfg.enable_osd,
                 cfg.osd_style,
+                cfg.osd_position,
+                if cfg.osd_monitor.is_empty() { "primary" } else { cfg.osd_monitor.as_str() },
                 cfg.theme,
                 cfg.debug_mode
             );
@@ -5025,6 +5715,7 @@ fn main() -> Result<()> {
 
     let path_clone = path.clone();
     let (osd_tx, osd_rx) = std::sync::mpsc::channel::<OsdMsg>();
+    let osd_ui = osd_tx.clone();
 
     let link = UiLink::new(Arc::new(AtomicBool::new(false)));
     let link_worker = link.clone();
@@ -5059,7 +5750,7 @@ fn main() -> Result<()> {
     let run = eframe::run_native(
         "RVCI",
         native_options,
-        Box::new(move |cc| Ok(Box::new(RvciApp::new(cc, path, link)))),
+        Box::new(move |cc| Ok(Box::new(RvciApp::new(cc, path, link, osd_ui)))),
     );
 
     if let Err(e) = run {
@@ -5447,6 +6138,149 @@ mod tests {
         assert!(!osd_is_mono());
 
         assert_eq!(OSD_STYLES.len(), OSD_STYLE_LABELS.len());
+    }
+
+    fn fake_monitor(device: &str, primary: bool, x: i32, w: i32) -> MonitorInfo {
+        MonitorInfo {
+            device: device.to_string(),
+            number: monitor_number(device),
+            primary,
+            dpi: 96,
+            bounds: (x, 0, x + w, 1080),
+            work: (x, 0, x + w, 1040),
+        }
+    }
+
+    #[test]
+    fn a_utf8_bom_does_not_look_like_a_corrupt_config() {
+        let dir = std::env::temp_dir().join("rvci-test-bom");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("mapping.json");
+
+        let mut cfg = AppConfig::default();
+        cfg.serial.port = "COM7".into();
+        assert!(save_config(&path, &cfg));
+
+        let body = std::fs::read(&path).expect("config written");
+        let mut bommed = vec![0xEF, 0xBB, 0xBF];
+        bommed.extend_from_slice(&body);
+        std::fs::write(&path, &bommed).expect("bom written");
+
+        match load_config(&path) {
+            ConfigLoad::Loaded(back) => assert_eq!(
+                back.serial.port, "COM7",
+                "an editor that adds a BOM must not cost the user their config"
+            ),
+            _ => panic!("a BOM made the config look unreadable"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn osd_position_is_normalised_and_survives_a_round_trip() {
+        let mut cfg = AppConfig::default();
+        assert_eq!(cfg.osd_position, "bottom");
+        assert!(cfg.osd_monitor.is_empty(), "no display is pinned by default");
+
+        cfg.osd_position = "middle-of-nowhere".into();
+        sanitize_config(&mut cfg);
+        assert_eq!(cfg.osd_position, "bottom", "unknown spots fall back");
+
+        for spot in OSD_POSITIONS {
+            let mut cfg = AppConfig::default();
+            cfg.osd_position = spot.to_string();
+            sanitize_config(&mut cfg);
+            assert_eq!(cfg.osd_position, spot, "{spot} must survive sanitising");
+        }
+
+        assert_eq!(OSD_POSITIONS.len(), OSD_POSITION_LABELS.len());
+        set_osd_position("top-right");
+        assert_eq!(osd_position(), osd_position_index("top-right"));
+        set_osd_position("bottom");
+        assert_eq!(osd_position(), 0);
+    }
+
+    #[test]
+    fn every_spot_lands_inside_the_work_area() {
+        let work = (0, 0, 1920, 1040);
+        let (w, h, margin) = (320, 90, 28);
+        for (i, name) in OSD_POSITIONS.iter().enumerate() {
+            let (x, y) = osd_placement(work, w, h, margin, i);
+            assert!(x >= work.0 && x + w <= work.2, "{name} left the screen sideways");
+            assert!(y >= work.1 && y + h <= work.3, "{name} left the screen vertically");
+        }
+
+        assert_eq!(osd_placement(work, w, h, margin, osd_position_index("bottom")), (800, 922));
+        assert_eq!(osd_placement(work, w, h, margin, osd_position_index("top")), (800, 28));
+        assert_eq!(osd_placement(work, w, h, margin, osd_position_index("left")), (28, 475));
+        assert_eq!(osd_placement(work, w, h, margin, osd_position_index("right")), (1572, 475));
+        assert_eq!(osd_placement(work, w, h, margin, osd_position_index("top-left")), (28, 28));
+        assert_eq!(
+            osd_placement(work, w, h, margin, osd_position_index("bottom-right")),
+            (1572, 922)
+        );
+    }
+
+    #[test]
+    fn a_second_monitor_gets_its_own_coordinates() {
+        let work = (1920, 0, 5760, 2160);
+        let (x, y) = osd_placement(work, 480, 135, 42, osd_position_index("bottom"));
+        assert_eq!((x, y), (3600, 1983), "the OSD stays on the monitor it was sent to");
+    }
+
+    #[test]
+    fn the_display_pick_falls_back_when_the_monitor_is_unplugged() {
+        let list = vec![
+            fake_monitor("\\\\.\\DISPLAY1", true, 0, 1920),
+            fake_monitor("\\\\.\\DISPLAY2", false, 1920, 2560),
+        ];
+
+        assert_eq!(pick_monitor(&list, "").unwrap().device, "\\\\.\\DISPLAY1");
+        assert_eq!(
+            pick_monitor(&list, "\\\\.\\DISPLAY2").unwrap().device,
+            "\\\\.\\DISPLAY2"
+        );
+        assert_eq!(
+            pick_monitor(&list, "\\\\.\\DISPLAY9").unwrap().device,
+            "\\\\.\\DISPLAY1",
+            "a pinned display that is gone falls back to the primary one"
+        );
+
+        let no_primary = vec![fake_monitor("\\\\.\\DISPLAY3", false, 0, 1920)];
+        assert_eq!(
+            pick_monitor(&no_primary, "").unwrap().device,
+            "\\\\.\\DISPLAY3",
+            "without a primary flag the first display wins"
+        );
+        assert!(pick_monitor(&[], "").is_none(), "no displays, no crash");
+    }
+
+    #[test]
+    fn monitor_numbers_come_from_the_device_name() {
+        assert_eq!(monitor_number("\\\\.\\DISPLAY1"), 1);
+        assert_eq!(monitor_number("\\\\.\\DISPLAY12"), 12);
+        assert_eq!(monitor_number("weird"), 0);
+        assert_eq!(monitor_number(""), 0);
+    }
+
+    #[test]
+    fn the_options_row_says_where_the_osd_goes() {
+        let list = vec![
+            fake_monitor("\\\\.\\DISPLAY1", true, 0, 1920),
+            fake_monitor("\\\\.\\DISPLAY2", false, 1920, 2560),
+        ];
+        let mut cfg = AppConfig::default();
+        assert_eq!(osd_target_summary(&cfg, &list), "Bottom");
+
+        cfg.osd_position = "top-right".into();
+        cfg.osd_monitor = "\\\\.\\DISPLAY2".into();
+        assert_eq!(osd_target_summary(&cfg, &list), "Top right, display 2");
+
+        assert_eq!(
+            osd_target_summary(&cfg, &list[..1]),
+            "Top right",
+            "one display means the display never gets mentioned"
+        );
     }
 
     #[test]
