@@ -1418,11 +1418,21 @@ impl Smoother {
     }
 }
 
-fn switch_device(clean_name: &str) {
-    if clean_name == "None" || clean_name.is_empty() { return; }
+fn match_playback_device<'a>(
+    devices: &'a [(String, String)],
+    clean_name: &str,
+) -> Option<&'a (String, String)> {
+    if clean_name == "None" || clean_name.is_empty() {
+        return None;
+    }
+    let wanted = clean_name.to_lowercase();
+    devices.iter().find(|(name, _id)| name.to_lowercase().contains(&wanted))
+}
+
+fn switch_device(clean_name: &str) -> Option<String> {
+    if clean_name == "None" || clean_name.is_empty() { return None; }
     let all_devices = AudioScanner::get_playback_devices_with_ids();
-    let match_result = all_devices.iter()
-        .find(|(name, _id)| name.to_lowercase().contains(&clean_name.to_lowercase()));
+    let match_result = match_playback_device(&all_devices, clean_name);
 
     if match_result.is_none() {
         log_warn!("audio: no playback device matches \"{clean_name}\", output not switched");
@@ -1443,6 +1453,7 @@ fn switch_device(clean_name: &str) {
             }
         }
     }
+    match_result.map(|(name, _)| name.clone())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1512,11 +1523,28 @@ impl UiLink {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OsdKind {
+    Level,
+    Output,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct OsdMsg {
+    kind: OsdKind,
     label: String,
     level: f32,
     muted: bool,
+}
+
+impl OsdMsg {
+    fn level(label: String, level: f32, muted: bool) -> Self {
+        Self { kind: OsdKind::Level, label, level, muted }
+    }
+
+    fn output(label: String) -> Self {
+        Self { kind: OsdKind::Output, label, level: 0.0, muted: false }
+    }
 }
 
 const OSD_RAW_STEP: f32 = 15.0;
@@ -1642,11 +1670,11 @@ fn spawn_system_volume_osd(tx: Sender<OsdMsg>) {
         if let Ok(vol) = AudioController::get_system_volume() {
             let level = vol.GetMasterVolumeLevelScalar().unwrap_or(0.0);
             let muted = vol.GetMute().map(|b| b.as_bool()).unwrap_or(false);
-            let _ = tx.send(OsdMsg {
-                label: "Master Volume".to_string(),
-                level: level.clamp(0.0, 1.0),
+            let _ = tx.send(OsdMsg::level(
+                "Master Volume".to_string(),
+                level.clamp(0.0, 1.0),
                 muted,
-            });
+            ));
         }
         CoUninitialize();
     });
@@ -1942,7 +1970,12 @@ fn run_serial_processing(
         if line == "WORKS 1" || line == "WORKS 2" {
             let target = if line == "WORKS 1" { &config.work_device_1 } else { &config.work_device_2 };
             log_info!("input: {line} switch, moving the default output to {target}");
-            switch_device(target);
+            let landed = switch_device(target);
+            if config.enable_osd {
+                if let Some(name) = landed {
+                    let _ = osd_tx.send(OsdMsg::output(name));
+                }
+            }
             system_volume = None;
             sessions.fetched = None;
             continue;
@@ -1977,11 +2010,11 @@ fn run_serial_processing(
                                         muted_now[di] = want;
                                         if config.enable_osd && gate.mute_changed(di, want) {
                                             if let Some(label) = osd_label(&config.dials[di]) {
-                                                let _ = osd_tx.send(OsdMsg {
+                                                let _ = osd_tx.send(OsdMsg::level(
                                                     label,
-                                                    level: level_now[di],
-                                                    muted: want,
-                                                });
+                                                    level_now[di],
+                                                    want,
+                                                ));
                                             }
                                         }
                                         ui.publish(&level_now, &muted_now);
@@ -2181,11 +2214,11 @@ fn run_serial_processing(
 
             if config.enable_osd && show_osd {
                 if let Some(label) = osd_label(dial_cfg) {
-                    let _ = osd_tx.send(OsdMsg {
+                    let _ = osd_tx.send(OsdMsg::level(
                         label,
-                        level: quantized,
-                        muted: want_mute || observed_mute.unwrap_or(false),
-                    });
+                        quantized,
+                        want_mute || observed_mute.unwrap_or(false),
+                    ));
                 }
             }
         }
@@ -2757,11 +2790,7 @@ impl RvciApp {
     }
 
     fn preview_osd(&self) {
-        let msg = OsdMsg {
-            label: "Preview".to_string(),
-            level: 0.66,
-            muted: false,
-        };
+        let msg = OsdMsg::level("Preview".to_string(), 0.66, false);
         if self.osd_tx.send(msg).is_err() {
             log_warn!("ui: the OSD thread is gone, cannot preview the position");
         }
@@ -3295,7 +3324,15 @@ impl RvciApp {
                                 .clicked()
                             {
                                 let name = extract_clean_name(&stored);
-                                std::thread::spawn(move || switch_device(&name));
+                                let tx = self.osd_tx.clone();
+                                let announce = self.cfg.enable_osd;
+                                std::thread::spawn(move || {
+                                    if let Some(landed) = switch_device(&name) {
+                                        if announce {
+                                            let _ = tx.send(OsdMsg::output(landed));
+                                        }
+                                    }
+                                });
                             }
                             let w = ui.available_width();
                             if let Some(i) = select(
@@ -4130,11 +4167,6 @@ fn spot_picker(ui: &mut egui::Ui, current: usize) -> Option<usize> {
     let cy = ui.ctx().animate_value_with_time(id.with("y"), goal.center().y, 0.16);
     let live = egui::Rect::from_center_size(egui::pos2(cx, cy), goal.size());
 
-    spot_plate(
-        ui.painter(),
-        live.translate(egui::vec2(0.0, 2.0)),
-        Color32::from_black_alpha(36),
-    );
     spot_plate(ui.painter(), live, accent());
 
     let face = contrast_text(accent());
@@ -4947,7 +4979,7 @@ fn osd_target_summary(cfg: &AppConfig, monitors: &[MonitorInfo]) -> String {
 }
 
 mod osd {
-    use super::{accent, is_light_color, mix, pal, OsdMsg};
+    use super::{accent, is_light_color, mix, pal, OsdKind, OsdMsg};
     use std::sync::mpsc::Receiver;
     use std::time::{Duration, Instant};
 
@@ -4958,7 +4990,8 @@ mod osd {
         CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, DrawTextW,
         SelectObject, SetBkMode, SetTextColor, AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY,
         BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DEFAULT_CHARSET, DEFAULT_PITCH,
-        DIB_RGB_COLORS, DT_LEFT, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, FF_DONTCARE,
+        DIB_RGB_COLORS, DT_END_ELLIPSIS, DT_LEFT, DT_RIGHT, DT_SINGLELINE, DT_VCENTER,
+        FF_DONTCARE,
         FONT_CLIP_PRECISION, FW_NORMAL, FW_SEMIBOLD, HBITMAP, HDC, HFONT, HGDIOBJ, OUT_TT_PRECIS,
         TRANSPARENT,
     };
@@ -4973,11 +5006,11 @@ mod osd {
         WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
     };
 
-    const BASE_W: f32 = 320.0;
-    const BASE_H: f32 = 90.0;
+    const BASE_W: f32 = 308.0;
+    const BASE_H: f32 = 78.0;
     const BASE_MARGIN: f32 = 28.0;
     const CORNER: f32 = 20.0;
-    const SHADOW: f32 = 14.0;
+    const PAD: f32 = 1.0;
     const BORDER_W: f32 = 1.3;
 
     const FADE_IN_MS: f32 = 120.0;
@@ -5036,7 +5069,6 @@ mod osd {
         h: i32,
         inner: Vec<u8>,
         edge: Vec<u8>,
-        halo: Vec<u8>,
         bar: Vec<u8>,
     }
 
@@ -5050,7 +5082,7 @@ mod osd {
                     return None;
                 }
             };
-            let (inner, edge, halo) = build_masks(w, h, scale);
+            let (inner, edge) = build_masks(w, h, scale);
             Some(Self {
                 surface,
                 glyphs,
@@ -5058,7 +5090,6 @@ mod osd {
                 h,
                 inner,
                 edge,
-                halo,
                 bar: vec![0u8; (w * h) as usize],
             })
         }
@@ -5070,8 +5101,8 @@ mod osd {
     }
 
     fn panel_rect(w: i32, h: i32, scale: f32) -> (f32, f32, f32, f32) {
-        let side = SHADOW * scale * 0.5;
-        (side, side * 0.6, w as f32 - side, h as f32 - side * 1.5)
+        let side = PAD * scale;
+        (side, side, w as f32 - side, h as f32 - side)
     }
 
     fn corner_distance(x: f32, y: f32, rect: (f32, f32, f32, f32), radius: f32) -> f32 {
@@ -5085,23 +5116,15 @@ mod osd {
         (0.5 - corner_distance(x, y, rect, radius)).clamp(0.0, 1.0)
     }
 
-    fn build_masks(w: i32, h: i32, scale: f32) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    fn build_masks(w: i32, h: i32, scale: f32) -> (Vec<u8>, Vec<u8>) {
         let outer = panel_rect(w, h, scale);
         let radius = CORNER * scale;
         let bw = BORDER_W * scale;
         let inner_rect = (outer.0 + bw, outer.1 + bw, outer.2 - bw, outer.3 - bw);
         let inner_radius = (radius - bw).max(1.0);
-        let glow = (
-            outer.0 - 1.0 * scale,
-            outer.1 + 3.0 * scale,
-            outer.2 + 1.0 * scale,
-            outer.3 + 5.0 * scale,
-        );
-        let reach = SHADOW * scale;
 
         let mut inner = vec![0u8; (w * h) as usize];
         let mut edge = vec![0u8; (w * h) as usize];
-        let mut halo = vec![0u8; (w * h) as usize];
         for y in 0..h {
             for x in 0..w {
                 let fx = x as f32 + 0.5;
@@ -5111,14 +5134,9 @@ mod osd {
                 let in_cov = coverage(fx, fy, inner_rect, inner_radius);
                 inner[idx] = (in_cov * 255.0) as u8;
                 edge[idx] = ((out_cov - in_cov).clamp(0.0, 1.0) * 255.0) as u8;
-                if out_cov < 1.0 {
-                    let d = corner_distance(fx, fy, glow, radius + 1.0 * scale).max(0.0);
-                    let s = (1.0 - (d / reach).clamp(0.0, 1.0)).powi(2);
-                    halo[idx] = ((1.0 - out_cov) * s * 255.0) as u8;
-                }
             }
         }
-        (inner, edge, halo)
+        (inner, edge)
     }
 
     struct Fonts {
@@ -5175,7 +5193,6 @@ mod osd {
         sub: Color32,
         track: Color32,
         fill: Color32,
-        shadow: f32,
     }
 
     fn skin(muted: bool) -> Skin {
@@ -5213,7 +5230,6 @@ mod osd {
                 sub: Color32::from_rgb(96, 102, 114),
                 track: Color32::from_rgb(206, 210, 218),
                 fill,
-                shadow: 0.26,
             }
         } else {
             let base = Color32::from_rgb(21, 22, 27);
@@ -5226,7 +5242,6 @@ mod osd {
                 sub: Color32::from_rgb(168, 175, 188),
                 track: Color32::from_rgb(96, 101, 114),
                 fill,
-                shadow: 0.50,
             }
         }
     }
@@ -5286,6 +5301,7 @@ mod osd {
         let mut canvas: Option<Canvas> = None;
         let mut fonts: Option<Fonts> = None;
 
+        let mut kind = OsdKind::Level;
         let mut label = String::new();
         let mut target = 0.0f32;
         let mut shown = 0.0f32;
@@ -5321,9 +5337,15 @@ mod osd {
                     shown = m.level.clamp(0.0, 1.0);
                     alpha = 0.0;
                 }
+                kind = m.kind;
                 label = m.label;
-                target = m.level.clamp(0.0, 1.0);
-                muted = m.muted;
+                if kind == OsdKind::Output {
+                    target = shown;
+                    muted = false;
+                } else {
+                    target = m.level.clamp(0.0, 1.0);
+                    muted = m.muted;
+                }
                 deadline = Instant::now() + Duration::from_millis(HOLD_MS);
                 holding = true;
 
@@ -5390,7 +5412,8 @@ mod osd {
             }
 
             if let (Some(c), Some(f)) = (canvas.as_mut(), fonts.as_ref()) {
-                draw(c, f, scale, &label, shown, muted, alpha);
+                let frame = Frame { kind, label: &label, level: shown, muted };
+                draw(c, f, scale, frame, alpha);
                 present(hwnd, c);
                 if pending_show {
                     pending_show = false;
@@ -5480,19 +5503,20 @@ mod osd {
         );
     }
 
-    unsafe fn draw(
-        canvas: &mut Canvas,
-        fonts: &Fonts,
-        scale: f32,
-        label: &str,
+    struct Frame<'a> {
+        kind: OsdKind,
+        label: &'a str,
         level: f32,
         muted: bool,
-        fade: f32,
-    ) {
+    }
+
+    unsafe fn draw(canvas: &mut Canvas, fonts: &Fonts, scale: f32, frame: Frame, fade: f32) {
+        let Frame { kind, label, level, muted } = frame;
         let s = skin(muted);
         let (w, h) = (canvas.w, canvas.h);
         let total = (w * h) as usize;
         let rect = panel_rect(w, h, scale);
+        let is_output = kind == OsdKind::Output;
 
         let surface = std::slice::from_raw_parts_mut(canvas.surface.bits, total);
         surface.fill(bgr(s.panel));
@@ -5510,7 +5534,7 @@ mod osd {
             inner_l - 1.0
         };
 
-        {
+        if !is_output {
             let track_bgr = bgr(s.track);
             let fill_bgr = bgr(s.fill);
             let y0 = (bar_t.floor() as i32).max(0);
@@ -5539,34 +5563,55 @@ mod osd {
         SetBkMode(gdc, TRANSPARENT);
         let old_font = SelectObject(gdc, fonts.title.into());
         SetTextColor(gdc, COLORREF(0x00FF_FFFF));
-        let mut title_rc = RECT {
+        let title_rc = RECT {
             left: inner_l as i32,
             top: (rect.1 + 13.0 * scale) as i32,
-            right: (inner_r - 66.0 * scale) as i32,
+            right: if is_output { inner_r as i32 } else { (inner_r - 66.0 * scale) as i32 },
             bottom: (rect.1 + 41.0 * scale) as i32,
         };
-        let mut title = to_utf16(label);
+        let mut head_rc = title_rc;
+        let mut title = to_utf16(if is_output { "Output" } else { label });
         if !title.is_empty() {
-            DrawTextW(gdc, &mut title, &mut title_rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            DrawTextW(gdc, &mut title, &mut head_rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         }
 
         SelectObject(gdc, fonts.value.into());
-        let readout = if muted {
-            "Muted".to_string()
+        let mut sub_top = h;
+        if is_output {
+            sub_top = (rect.3 - 33.0 * scale) as i32;
+            let mut name_rc = RECT {
+                left: inner_l as i32,
+                top: (rect.3 - 31.0 * scale) as i32,
+                right: inner_r as i32,
+                bottom: (rect.3 - 9.0 * scale) as i32,
+            };
+            let mut name = to_utf16(label);
+            if !name.is_empty() {
+                DrawTextW(
+                    gdc,
+                    &mut name,
+                    &mut name_rc,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+                );
+            }
         } else {
-            format!("{}%", (level * 100.0).round() as i32)
-        };
-        let mut readout_rc = RECT {
-            left: (inner_r - 90.0 * scale) as i32,
-            top: title_rc.top,
-            right: inner_r as i32,
-            bottom: title_rc.bottom,
-        };
-        let mut readout_w = to_utf16(&readout);
-        DrawTextW(gdc, &mut readout_w, &mut readout_rc, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+            let readout = if muted {
+                "Muted".to_string()
+            } else {
+                format!("{}%", (level * 100.0).round() as i32)
+            };
+            let mut readout_rc = RECT {
+                left: (inner_r - 90.0 * scale) as i32,
+                top: title_rc.top,
+                right: inner_r as i32,
+                bottom: title_rc.bottom,
+            };
+            let mut readout_w = to_utf16(&readout);
+            DrawTextW(gdc, &mut readout_w, &mut readout_rc, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        }
         SelectObject(gdc, old_font);
 
-        let title_split = title_rc.right.max(0) as usize;
+        let title_split = if is_output { w } else { title_rc.right.max(0) } as usize;
         let ink = (s.ink.r() as f32, s.ink.g() as f32, s.ink.b() as f32);
         let sub = (s.sub.r() as f32, s.sub.g() as f32, s.sub.b() as f32);
         let border = (
@@ -5580,11 +5625,10 @@ mod osd {
                 let idx = (y * w + x) as usize;
                 let in_cov = canvas.inner[idx] as f32 * INV255;
                 let edge_cov = canvas.edge[idx] as f32 * INV255;
-                let glow = canvas.halo[idx] as f32 * INV255 * s.shadow;
                 let bar_cov = canvas.bar[idx] as f32 * INV255;
                 let glyph = (glyph_bits[idx] & 0xFF) as f32 * INV255;
 
-                if in_cov <= 0.0 && edge_cov <= 0.0 && glow <= 0.0 {
+                if in_cov <= 0.0 && edge_cov <= 0.0 {
                     surface[idx] = 0;
                     continue;
                 }
@@ -5611,16 +5655,16 @@ mod osd {
                 }
 
                 if glyph > 0.0 {
-                    let text_col = if (x as usize) >= title_split { sub } else { ink };
+                    let text_col = if y >= sub_top || (x as usize) >= title_split {
+                        sub
+                    } else {
+                        ink
+                    };
                     let keep = 1.0 - glyph;
                     a = glyph + a * keep;
                     r = text_col.0 * glyph + r * keep;
                     g = text_col.1 * glyph + g * keep;
                     b = text_col.2 * glyph + b * keep;
-                }
-
-                if glow > 0.0 {
-                    a += glow * (1.0 - a);
                 }
 
                 let a = (a * fade).clamp(0.0, 1.0);
@@ -6281,6 +6325,42 @@ mod tests {
             "Top right",
             "one display means the display never gets mentioned"
         );
+    }
+
+    #[test]
+    fn the_output_switcher_names_the_device_it_landed_on() {
+        let devices = vec![
+            ("Speakers (2- M-Audio AIR 192|4)".to_string(), "{id-a}".to_string()),
+            ("LG ULTRAGEAR (NVIDIA High Definition Audio)".to_string(), "{id-b}".to_string()),
+        ];
+
+        let hit = match_playback_device(&devices, "2- M-Audio AIR 192|4");
+        assert_eq!(
+            hit.map(|(name, _)| name.as_str()),
+            Some("Speakers (2- M-Audio AIR 192|4)"),
+            "the OSD should say the full device name, not the clean name from the config"
+        );
+        assert_eq!(
+            match_playback_device(&devices, "nvidia high definition audio").map(|(n, _)| n.as_str()),
+            Some("LG ULTRAGEAR (NVIDIA High Definition Audio)"),
+            "matching ignores case"
+        );
+        assert!(match_playback_device(&devices, "None").is_none());
+        assert!(match_playback_device(&devices, "").is_none());
+        assert!(match_playback_device(&devices, "Headphones").is_none());
+    }
+
+    #[test]
+    fn an_output_message_carries_no_level() {
+        let msg = OsdMsg::output("Speakers (2- M-Audio AIR 192|4)".to_string());
+        assert_eq!(msg.kind, OsdKind::Output);
+        assert_eq!(msg.level, 0.0);
+        assert!(!msg.muted, "an output switch is never a mute");
+
+        let vol = OsdMsg::level("Spotify".to_string(), 0.42, true);
+        assert_eq!(vol.kind, OsdKind::Level);
+        assert_eq!(vol.level, 0.42);
+        assert!(vol.muted);
     }
 
     #[test]
