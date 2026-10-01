@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::os::windows::io::AsRawHandle;
 
 use eframe::egui;
 use egui::{Color32, RichText, ViewportBuilder, ViewportCommand};
@@ -25,7 +26,8 @@ use tray_icon::{
 };
 
 use windows::core::{Interface, interface, GUID, PCWSTR, PWSTR, IUnknown, IUnknown_Vtbl};
-use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Devices::Communication::{SetCommTimeouts, COMMTIMEOUTS};
 use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
 use windows::Win32::Media::Audio::*;
 use windows::Win32::System::Com::*;
@@ -1753,10 +1755,33 @@ fn run_volume_logic_loop(config_path: PathBuf, osd_tx: Sender<OsdMsg>, ui: UiLin
 struct SessionCache {
     list: Vec<(String, ISimpleAudioVolume)>,
     fetched: Option<Instant>,
+    seen: HashSet<String>,
 }
 
 impl SessionCache {
-    fn new() -> Self { Self { list: Vec::new(), fetched: None } }
+    fn new() -> Self { Self { list: Vec::new(), fetched: None, seen: HashSet::new() } }
+
+    unsafe fn appeared(&mut self) -> bool {
+        let mut now: HashSet<String> = HashSet::new();
+        let Ok(mgr) = AudioController::get_session_manager() else { return false };
+        let Ok(enum_sess) = mgr.GetSessionEnumerator() else { return false };
+        let Ok(count) = enum_sess.GetCount() else { return false };
+        for s_idx in 0..count {
+            let Ok(sess) = enum_sess.GetSession(s_idx) else { continue };
+            let Ok(s2) = Interface::cast::<IAudioSessionControl2>(&sess) else { continue };
+            match s2.GetProcessId() {
+                Ok(pid) if pid != 0 => {}
+                _ => continue,
+            }
+            if let Ok(p) = s2.GetSessionInstanceIdentifier() {
+                now.insert(p.to_string().unwrap_or_default());
+                CoTaskMemFree(Some(p.as_ptr() as *const c_void));
+            }
+        }
+        let fresh = now.iter().any(|id| !self.seen.contains(id));
+        self.seen = now;
+        fresh
+    }
 
     fn stale(&self) -> bool {
         self.fetched.map(|t| t.elapsed() > Duration::from_secs(2)).unwrap_or(true)
@@ -1789,6 +1814,12 @@ impl SessionCache {
 
 const MAX_SERIAL_LINE: u64 = 512;
 const BUTTON_MIN_GAP: Duration = Duration::from_millis(40);
+const SESSION_SCAN_EVERY: Duration = Duration::from_millis(250);
+
+fn force_reapply(last_applied: &mut [f32], settle: &mut u32) {
+    last_applied.iter_mut().for_each(|v| *v = -1.0);
+    *settle = (*settle).max(1);
+}
 
 fn button_ready(fired: &mut Vec<Option<Instant>>, id: usize) -> bool {
     while fired.len() <= id {
@@ -1804,6 +1835,13 @@ fn button_ready(fired: &mut Vec<Option<Instant>>, id: usize) -> bool {
     true
 }
 
+fn use_wch_safe_timeouts(port: serialport::COMPort) -> serialport::Result<serialport::COMPort> {
+    let timeouts = COMMTIMEOUTS { ReadIntervalTimeout: u32::MAX, ..Default::default() };
+    unsafe { SetCommTimeouts(HANDLE(port.as_raw_handle()), &timeouts) }
+        .map_err(|e| serialport::Error::from(std::io::Error::from(e)))?;
+    Ok(port)
+}
+
 fn run_serial_processing(
     config: &AppConfig,
     config_path: &Path,
@@ -1813,7 +1851,8 @@ fn run_serial_processing(
 ) -> Result<()> {
     let port = match serialport::new(&config.serial.port, config.serial.baud)
         .timeout(Duration::from_millis(config.serial.timeout))
-        .open()
+        .open_native()
+        .and_then(use_wch_safe_timeouts)
     {
         Ok(p) => p,
         Err(e) => {
@@ -1828,16 +1867,16 @@ fn run_serial_processing(
         }
     };
     log_info!(
-        "serial: connected to {} @{} (timeout {}ms)",
+        "serial: connected to {} @{} (non-blocking reads)",
         config.serial.port,
-        config.serial.baud,
-        config.serial.timeout
+        config.serial.baud
     );
     ui.set_status(SerialStatus::Connected);
 
     let dial_count = config.dials.len();
     let mut reader = BufReader::new(port);
     let mut raw_line: Vec<u8> = Vec::with_capacity(MAX_SERIAL_LINE as usize);
+    let mut line_pending = false;
     let mut discarding = false;
     let mut last_update = Instant::now();
 
@@ -1896,8 +1935,19 @@ fn run_serial_processing(
     );
 
     let mut last_cfg_check = Instant::now();
+    let mut last_session_scan = Instant::now();
 
     loop {
+        if last_session_scan.elapsed() >= SESSION_SCAN_EVERY {
+            last_session_scan = Instant::now();
+            if unsafe { sessions.appeared() } {
+                log_debug!("audio: new audio session, applying the knob levels to it");
+                force_reapply(&mut last_applied, &mut settle);
+                system_volume = None;
+                sessions.fetched = None;
+            }
+        }
+
         if last_cfg_check.elapsed() >= Duration::from_millis(1000) {
             last_cfg_check = Instant::now();
             if let Ok(meta) = std::fs::metadata(config_path) {
@@ -1928,15 +1978,21 @@ fn run_serial_processing(
             }
         }
 
-        raw_line.clear();
-        let read = (&mut reader).take(MAX_SERIAL_LINE).read_until(b'\n', &mut raw_line);
-        let bytes = match read {
+        if !line_pending {
+            raw_line.clear();
+        }
+        let room = MAX_SERIAL_LINE.saturating_sub(raw_line.len() as u64);
+        let read = (&mut reader).take(room).read_until(b'\n', &mut raw_line);
+        line_pending = false;
+        match read {
             Ok(0) => {
+                line_pending = true;
                 std::thread::sleep(Duration::from_millis(10));
                 continue;
             }
-            Ok(n) => n,
+            Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                line_pending = true;
                 std::thread::sleep(Duration::from_millis(10));
                 continue;
             }
@@ -1945,14 +2001,14 @@ fn run_serial_processing(
                 ui.clear_levels();
                 return Err(anyhow::anyhow!("Serial error"));
             }
-        };
+        }
 
         let terminated = raw_line.last() == Some(&b'\n');
         if discarding {
             discarding = !terminated;
             continue;
         }
-        if !terminated && bytes as u64 >= MAX_SERIAL_LINE {
+        if !terminated && raw_line.len() as u64 >= MAX_SERIAL_LINE {
             log_warn!(
                 "serial: oversized line from {} (over {MAX_SERIAL_LINE} bytes), discarding to the next newline",
                 config.serial.port
@@ -1976,6 +2032,7 @@ fn run_serial_processing(
                     let _ = osd_tx.send(OsdMsg::output(name));
                 }
             }
+            force_reapply(&mut last_applied, &mut settle);
             system_volume = None;
             sessions.fetched = None;
             continue;
@@ -5001,10 +5058,15 @@ mod osd {
         CreateWindowExW, DefWindowProcW, DispatchMessageW, LoadCursorW, PeekMessageW,
         RegisterClassExW, SetWindowPos, ShowWindow, SystemParametersInfoW, TranslateMessage,
         UpdateLayeredWindow, HWND_TOPMOST, IDC_ARROW, MSG, PM_REMOVE, SPI_GETWORKAREA,
-        SWP_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, ULW_ALPHA,
-        WINDOW_EX_STYLE, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-        WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE,
+        SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, ULW_ALPHA, WINDOW_EX_STYLE, WNDCLASSEXW,
+        WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
+        WS_POPUP,
     };
+    use windows::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+    };
+    use windows::Win32::UI::Shell::{SHQueryUserNotificationState, QUNS_RUNNING_D3D_FULL_SCREEN};
 
     const BASE_W: f32 = 308.0;
     const BASE_H: f32 = 78.0;
@@ -5017,6 +5079,8 @@ mod osd {
     const FADE_OUT_MS: f32 = 200.0;
     const HOLD_MS: u64 = 1500;
     const FRAME_MS: u64 = 16;
+    const RAISE_MS: u64 = 250;
+    const BAR_EASE: f32 = 0.3;
     const INV255: f32 = 1.0 / 255.0;
 
     struct Layer {
@@ -5255,7 +5319,37 @@ mod osd {
         }
     }
 
+    pub fn fade_in(alpha: f32, step_ms: f32) -> f32 {
+        (alpha + step_ms / FADE_IN_MS).min(1.0)
+    }
+
+    pub fn fade_out(alpha: f32, step_ms: f32) -> f32 {
+        alpha - step_ms / FADE_OUT_MS
+    }
+
+    pub fn ease_toward(shown: f32, target: f32, step_ms: f32) -> f32 {
+        let ease = 1.0 - (1.0 - BAR_EASE).powf(step_ms / FRAME_MS as f32);
+        shown + (target - shown) * ease
+    }
+
+    unsafe fn keep_on_top(hwnd: HWND) {
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+        );
+    }
+
+    unsafe fn game_owns_the_screen() -> bool {
+        matches!(SHQueryUserNotificationState(), Ok(s) if s == QUNS_RUNNING_D3D_FULL_SCREEN)
+    }
+
     unsafe fn run(rx: Receiver<OsdMsg>) {
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
         let Ok(hinstance) = GetModuleHandleW(None) else {
             log_error!("osd: GetModuleHandleW failed, the overlay cannot start");
             return;
@@ -5314,6 +5408,9 @@ mod osd {
         let mut holding = false;
         let mut alpha = 0.0f32;
         let mut deadline = Instant::now();
+        let mut last_frame = Instant::now();
+        let mut last_raise = Instant::now();
+        let mut blocked = false;
         let mut msg = MSG::default();
 
         loop {
@@ -5336,6 +5433,16 @@ mod osd {
                 if fresh {
                     shown = m.level.clamp(0.0, 1.0);
                     alpha = 0.0;
+                    last_frame = Instant::now();
+                    let hidden = game_owns_the_screen();
+                    if hidden != blocked {
+                        blocked = hidden;
+                        if hidden {
+                            log_debug!("osd: a game is holding the screen in exclusive fullscreen, nothing can draw over it until the game runs borderless");
+                        } else {
+                            log_debug!("osd: the screen is composited again");
+                        }
+                    }
                 }
                 kind = m.kind;
                 label = m.label;
@@ -5387,17 +5494,26 @@ mod osd {
             }
 
             if !visible {
+                last_frame = Instant::now();
                 continue;
             }
 
-            let step = FRAME_MS as f32;
+            let now = Instant::now();
+            let step = (now - last_frame).as_secs_f32() * 1000.0;
+            last_frame = now;
+
+            if now.duration_since(last_raise) >= Duration::from_millis(RAISE_MS) {
+                last_raise = now;
+                keep_on_top(hwnd);
+            }
+
             if holding {
-                alpha = (alpha + step / FADE_IN_MS).min(1.0);
-                if Instant::now() >= deadline {
+                alpha = fade_in(alpha, step);
+                if now >= deadline {
                     holding = false;
                 }
             } else {
-                alpha -= step / FADE_OUT_MS;
+                alpha = fade_out(alpha, step);
                 if alpha <= 0.0 {
                     alpha = 0.0;
                     visible = false;
@@ -5406,7 +5522,7 @@ mod osd {
                 }
             }
 
-            shown += (target - shown) * 0.3;
+            shown = ease_toward(shown, target, step);
             if (target - shown).abs() < 0.002 {
                 shown = target;
             }
@@ -5931,6 +6047,25 @@ mod tests {
     }
 
     #[test]
+    fn a_reapply_pushes_every_knob_without_it_moving() {
+        let mut last_applied = vec![0.25, 0.8, 0.0];
+        let mut settle = 0;
+        force_reapply(&mut last_applied, &mut settle);
+        assert!(settle > 0, "an unchanged line has to get through the dedupe once");
+        for (knob, last) in [0.25, 0.8, 0.0].iter().zip(&last_applied) {
+            assert!(apply_decision(*knob, *last, false, None, false).level_changed);
+        }
+    }
+
+    #[test]
+    fn a_reapply_keeps_a_longer_settle_window() {
+        let mut last_applied = vec![0.5];
+        let mut settle = 14;
+        force_reapply(&mut last_applied, &mut settle);
+        assert_eq!(settle, 14);
+    }
+
+    #[test]
     fn osd_label_skips_unassigned_dials() {
         let sys = DialConfig { dial_type: "system".into(), process_name: None, inverted: false };
         let others = DialConfig { dial_type: "all_others".into(), process_name: None, inverted: false };
@@ -6361,6 +6496,35 @@ mod tests {
         assert_eq!(vol.kind, OsdKind::Level);
         assert_eq!(vol.level, 0.42);
         assert!(vol.muted);
+    }
+
+    #[test]
+    fn the_osd_bar_lands_in_the_same_place_however_choppy_the_frames_are() {
+        let mut smooth = 0.0f32;
+        for _ in 0..10 {
+            smooth = osd::ease_toward(smooth, 1.0, 16.0);
+        }
+        let choppy = osd::ease_toward(0.0, 1.0, 160.0);
+        assert!(
+            (smooth - choppy).abs() < 0.01,
+            "ten 16 ms steps gave {smooth}, one 160 ms step gave {choppy}"
+        );
+    }
+
+    #[test]
+    fn a_stalled_osd_thread_still_fades_out_on_time() {
+        let mut alpha = 1.0f32;
+        let mut ms = 0.0f32;
+        while alpha > 0.0 {
+            alpha = osd::fade_out(alpha, 16.0);
+            ms += 16.0;
+        }
+        assert!((192.0..=208.0).contains(&ms), "smooth fade took {ms} ms");
+        assert!(
+            osd::fade_out(1.0, 400.0) <= 0.0,
+            "one very late frame must finish the fade instead of stretching it"
+        );
+        assert_eq!(osd::fade_in(0.0, 400.0), 1.0);
     }
 
     #[test]
